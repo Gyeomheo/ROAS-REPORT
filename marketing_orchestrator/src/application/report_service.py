@@ -11,6 +11,10 @@ from typing import Any, Dict, List
 import polars as pl
 
 from src.application.analysis_service import run_subsidiary_analysis
+from src.application.reporting import lmdi as reporting_lmdi
+from src.application.reporting import metrics as reporting_metrics
+from src.application.reporting import rendering as reporting_rendering
+from src.application.reporting import selectors as reporting_selectors
 from src.infrastructure.excel_repository import load_input_frame, save_output_workbook
 from src.infrastructure.report_exporter import save_summary_html, save_summary_json
 
@@ -56,416 +60,85 @@ def _resolve_comparison_years(curr_year: int | None, prev_year: int | None) -> t
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    return float(value)
+    return reporting_metrics.to_float(value, default)
 
 
 def _safe_ratio(num: float, den: float) -> float | None:
-    if den <= 0:
-        return None
-    return num / den
+    return reporting_metrics.safe_ratio(num, den)
 
 
 def _safe_pct_change(curr: float | None, prev: float | None) -> float | None:
-    if curr is None or prev is None or prev <= 0:
-        return None
-    return (curr - prev) / prev
+    return reporting_metrics.safe_pct_change(curr, prev)
 
 
 def _safe_ratio_expr(num: pl.Expr, den: pl.Expr) -> pl.Expr:
-    safe_den = pl.when(den > 0).then(den).otherwise(None)
-    return num / safe_den
+    return reporting_metrics.safe_ratio_expr(num, den)
 
 
 def _safe_pct_change_expr(curr: pl.Expr, prev: pl.Expr) -> pl.Expr:
-    safe_prev = pl.when(prev > 0).then(prev).otherwise(None)
-    return (curr - safe_prev) / safe_prev
+    return reporting_metrics.safe_pct_change_expr(curr, prev)
 
 
 def _safe_log_ratio_expr(curr: pl.Expr, prev: pl.Expr) -> pl.Expr:
-    safe_curr = pl.when(curr > 0).then(curr).otherwise(None)
-    safe_prev = pl.when(prev > 0).then(prev).otherwise(None)
-    return (safe_curr / safe_prev).log()
+    return reporting_metrics.safe_log_ratio_expr(curr, prev)
 
 
 def _log_mean_expr(curr: pl.Expr, prev: pl.Expr) -> pl.Expr:
-    safe_curr = pl.when(curr > 0).then(curr).otherwise(None)
-    safe_prev = pl.when(prev > 0).then(prev).otherwise(None)
-    safe_den = pl.when(safe_curr != safe_prev).then(safe_curr.log() - safe_prev.log()).otherwise(None)
-    return (
-        pl.when(safe_curr.is_null() | safe_prev.is_null())
-        .then(None)
-        .when(safe_curr == safe_prev)
-        .then(safe_curr)
-        .otherwise((safe_curr - safe_prev) / safe_den)
-    )
+    return reporting_metrics.log_mean_expr(curr, prev)
 
 
 def _fmt_money(value: float | None) -> str:
-    if value is None:
-        return "$0"
-    abs_value = abs(value)
-    if abs_value >= 1_000_000:
-        return f"${abs_value / 1_000_000:.1f}M"
-    if abs_value >= 1_000:
-        return f"${abs_value / 1_000:.0f}K"
-    return f"${abs_value:.0f}"
+    return reporting_metrics.fmt_money(value)
 
 
 def _fmt_money_signed(value: float | None) -> str:
-    if value is None:
-        return "$0"
-    sign = "-" if value < 0 else "+"
-    return f"{sign}{_fmt_money(abs(value))}"
+    return reporting_metrics.fmt_money_signed(value)
 
 
 def _fmt_pct(value: float | None, signed: bool = True) -> str:
-    if value is None:
-        return "N/A"
-    pct = value * 100
-    if signed:
-        return f"{pct:+.0f}%".replace("+", "")
-    return f"{pct:.0f}%"
+    return reporting_metrics.fmt_pct(value, signed=signed)
 
 
 def _fmt_pct_yoy(value: float | None, signed: bool = True) -> str:
-    base = _fmt_pct(value, signed=signed)
-    if base == "N/A":
-        return base
-    return f"{base} YoY"
+    return reporting_metrics.fmt_pct_yoy(value, signed=signed)
 
 
 def _fmt_roas(value: float | None) -> str:
-    if value is None:
-        return "N/A"
-    return f"{value:.1f}"
+    return reporting_metrics.fmt_roas(value)
 
 
 def _fmt_pp(value: float | None) -> str:
-    if value is None:
-        return "N/A"
-    return f"{value * 100:+.0f}%p"
+    return reporting_metrics.fmt_pp(value)
 
 
 def _fmt_driver_metric(metric: str, value: float | None) -> str:
-    if value is None:
-        return "N/A"
-    if metric == "CPC":
-        return f"${value:.2f}"
-    if metric == "CVR":
-        return f"{value * 100:.2f}%"
-    if metric == "AOV":
-        return _fmt_money(value)
-    return f"{value:.3f}"
+    return reporting_metrics.fmt_driver_metric(metric, value)
 
 
 
 def _trend(value: float | None, eps: float = 1e-9) -> str:
-    if value is None:
-        return "unknown"
-    if value > eps:
-        return "up"
-    if value < -eps:
-        return "down"
-    return "flat"
+    return reporting_metrics.trend(value, eps=eps)
 
 
 def _direct_contribution_pct(child_impact: float, parent_delta: float, mode_tag: str) -> float | None:
-    parent_abs = abs(parent_delta)
-    if parent_abs <= 0:
-        return None
-    mode = (mode_tag or "").upper()
-    if mode == "ISSUE":
-        return max(0.0, -child_impact) / parent_abs
-    if mode in {"IMPROVE", "DEFENSE"}:
-        return max(0.0, child_impact) / parent_abs
-    return abs(child_impact) / parent_abs
+    return reporting_metrics.direct_contribution_pct(child_impact, parent_delta, mode_tag)
 
 def _sum_aggregations() -> list[pl.Expr]:
-    return [
-        pl.col("Revenue_curr").sum().alias("Revenue_curr_sum"),
-        pl.col("Revenue_prev").sum().alias("Revenue_prev_sum"),
-        pl.col("Spend_curr").sum().alias("Spend_curr_sum"),
-        pl.col("Spend_prev").sum().alias("Spend_prev_sum"),
-    ]
+    return reporting_lmdi.sum_aggregations()
 
 
 def _sum_aggregations_full() -> list[pl.Expr]:
-    return [
-        pl.col("Revenue_curr").sum().alias("Revenue_curr_sum"),
-        pl.col("Revenue_prev").sum().alias("Revenue_prev_sum"),
-        pl.col("Spend_curr").sum().alias("Spend_curr_sum"),
-        pl.col("Spend_prev").sum().alias("Spend_prev_sum"),
-        pl.col("Clicks_curr").sum().alias("Clicks_curr_sum"),
-        pl.col("Clicks_prev").sum().alias("Clicks_prev_sum"),
-        pl.col("Orders_curr").sum().alias("Orders_curr_sum"),
-        pl.col("Orders_prev").sum().alias("Orders_prev_sum"),
-    ]
-
-
-def _to_key(row: Dict[str, Any], dims: List[str]) -> tuple[Any, ...]:
-    return tuple(row.get(dim) for dim in dims)
+    return reporting_lmdi.sum_aggregations_full()
 
 
 def _scope_maps(
     df: pl.DataFrame,
 ) -> tuple[Dict[tuple[Any, ...], Dict[str, Any]], Dict[tuple[Any, ...], Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    subsidiary_rows = df.group_by(["SUBSIDIARY"]).agg(_sum_aggregations_full()).to_dicts()
-    channel_rows = df.group_by(CHANNEL_DIMS).agg(_sum_aggregations_full()).to_dicts()
-    division_rows = df.group_by(DIVISION_DIMS).agg(_sum_aggregations_full()).to_dicts()
-    subsidiary_map = {str(row.get("SUBSIDIARY", "")): row for row in subsidiary_rows}
-    channel_map = {_to_key(row, CHANNEL_DIMS): row for row in channel_rows}
-    division_map = {_to_key(row, DIVISION_DIMS): row for row in division_rows}
-    return channel_map, division_map, subsidiary_map
+    return reporting_lmdi.scope_maps(df, channel_dims=CHANNEL_DIMS, division_dims=DIVISION_DIMS)
 
 
 def _division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
-    parent_df = (
-        df.group_by(["SUBSIDIARY"])
-        .agg(_sum_aggregations_full())
-        .with_columns(
-            [
-                pl.col("Revenue_curr_sum").alias("Parent_revenue_curr_sum"),
-                pl.col("Revenue_prev_sum").alias("Parent_revenue_prev_sum"),
-            ]
-        )
-        .with_columns(
-            [
-                (pl.col("Parent_revenue_curr_sum") - pl.col("Parent_revenue_prev_sum")).alias("Parent_revenue_delta"),
-                _safe_pct_change_expr(pl.col("Parent_revenue_curr_sum"), pl.col("Parent_revenue_prev_sum")).alias(
-                    "Parent_revenue_yoy_pct"
-                ),
-            ]
-        )
-        .sort(["SUBSIDIARY"])
-    )
-    parent_rows = parent_df.select(
-        [
-            "SUBSIDIARY",
-            "Parent_revenue_curr_sum",
-            "Parent_revenue_prev_sum",
-            "Parent_revenue_delta",
-            "Parent_revenue_yoy_pct",
-        ]
-    ).to_dicts()
-
-    division_df = (
-        df.group_by(["SUBSIDIARY", "DIVISION"])
-        .agg(_sum_aggregations_full())
-        .sort(["SUBSIDIARY", "DIVISION"])
-    )
-    if division_df.is_empty():
-        return [
-            {
-                "SUBSIDIARY": str(row.get("SUBSIDIARY", "")),
-                "Parent_revenue_curr_sum": _to_float(row.get("Parent_revenue_curr_sum")),
-                "Parent_revenue_prev_sum": _to_float(row.get("Parent_revenue_prev_sum")),
-                "Parent_revenue_delta": _to_float(row.get("Parent_revenue_delta")),
-                "Parent_revenue_yoy_pct": row.get("Parent_revenue_yoy_pct"),
-                "rows": [],
-            }
-            for row in parent_rows
-        ]
-
-    parent_join_df = parent_df.select(
-        [
-            "SUBSIDIARY",
-            "Parent_revenue_curr_sum",
-            "Parent_revenue_prev_sum",
-            "Parent_revenue_delta",
-        ]
-    )
-    joined = division_df.join(parent_join_df, on="SUBSIDIARY", how="left")
-    child_log_mean = _log_mean_expr(pl.col("Revenue_curr_sum"), pl.col("Revenue_prev_sum"))
-    parent_log_mean = _log_mean_expr(pl.col("Parent_revenue_curr_sum"), pl.col("Parent_revenue_prev_sum"))
-    parent_log_ratio = _safe_log_ratio_expr(pl.col("Parent_revenue_curr_sum"), pl.col("Parent_revenue_prev_sum"))
-    valid_lmdi = (
-        (pl.col("Revenue_curr_sum") > 0)
-        & (pl.col("Revenue_prev_sum") > 0)
-        & (pl.col("Parent_revenue_curr_sum") > 0)
-        & (pl.col("Parent_revenue_prev_sum") > 0)
-        & child_log_mean.is_not_null()
-        & parent_log_mean.is_not_null()
-        & parent_log_ratio.is_not_null()
-    )
-    joined = joined.with_columns(
-        [
-            pl.when(valid_lmdi)
-            .then((child_log_mean / parent_log_mean) * parent_log_ratio * pl.col("Parent_revenue_delta"))
-            .otherwise(pl.col("Revenue_curr_sum") - pl.col("Revenue_prev_sum"))
-            .alias("Impact_raw"),
-            pl.when(valid_lmdi).then(pl.lit("LMDI")).otherwise(pl.lit("DELTA_FALLBACK")).alias("Impact_raw_method"),
-        ]
-    )
-
-    residual_df = (
-        joined.group_by(["SUBSIDIARY"])
-        .agg(
-            [
-                pl.col("Impact_raw").sum().alias("Impact_raw_sum"),
-                pl.col("Impact_raw").abs().sum().alias("Abs_impact_raw_sum"),
-                pl.len().alias("Child_count"),
-            ]
-        )
-        .join(parent_join_df.select(["SUBSIDIARY", "Parent_revenue_delta"]), on="SUBSIDIARY", how="left")
-        .with_columns((pl.col("Parent_revenue_delta") - pl.col("Impact_raw_sum")).alias("Residual_parent"))
-        .select(["SUBSIDIARY", "Residual_parent", "Abs_impact_raw_sum", "Child_count"])
-    )
-
-    contribution_label_expr = (
-        pl.when(pl.col("Parent_revenue_delta") < 0)
-        .then(
-            pl.when(pl.col("Impact_adj") < 0)
-            .then(pl.lit("DECLINE_DRIVER"))
-            .otherwise(pl.lit("DECLINE_OFFSET"))
-        )
-        .when(pl.col("Parent_revenue_delta") > 0)
-        .then(
-            pl.when(pl.col("Impact_adj") > 0)
-            .then(pl.lit("GROWTH_DRIVER"))
-            .otherwise(pl.lit("GROWTH_OFFSET"))
-        )
-        .otherwise(pl.lit("NEUTRAL"))
-    )
-
-    contribution_df = (
-        joined.join(residual_df, on="SUBSIDIARY", how="left")
-        .with_columns(
-            pl.when(pl.col("Child_count") <= 0)
-            .then(0.0)
-            .when(pl.col("Abs_impact_raw_sum") > 0)
-            .then((pl.col("Impact_raw").abs() / pl.col("Abs_impact_raw_sum")) * pl.col("Residual_parent"))
-            .otherwise(pl.col("Residual_parent") / pl.col("Child_count"))
-            .alias("__residual_allocated")
-        )
-        .with_columns(
-            [
-                (pl.col("Impact_raw") + pl.col("__residual_allocated")).alias("Impact_adj"),
-                (pl.col("__residual_allocated").abs() > pl.lit(1e-12)).alias("Residual_applied_flag"),
-                (pl.col("Revenue_curr_sum") - pl.col("Revenue_prev_sum")).alias("Revenue_delta"),
-                _safe_pct_change_expr(pl.col("Revenue_curr_sum"), pl.col("Revenue_prev_sum")).alias("Revenue_yoy_pct"),
-                _safe_pct_change_expr(pl.col("Spend_curr_sum"), pl.col("Spend_prev_sum")).alias("Spend_yoy_pct"),
-                _safe_ratio_expr(pl.col("Revenue_curr_sum"), pl.col("Spend_curr_sum")).alias("ROAS_curr"),
-                _safe_ratio_expr(pl.col("Revenue_prev_sum"), pl.col("Spend_prev_sum")).alias("ROAS_prev"),
-            ]
-        )
-        .with_columns(
-            [
-                _safe_pct_change_expr(pl.col("ROAS_curr"), pl.col("ROAS_prev")).alias("ROAS_yoy_pct"),
-                pl.col("Parent_revenue_delta").abs().alias("__parent_abs_delta"),
-            ]
-        )
-        .with_columns(
-            [
-                pl.when(pl.col("__parent_abs_delta") > 0)
-                .then(pl.col("Impact_adj").abs() / pl.col("__parent_abs_delta"))
-                .otherwise(0.0)
-                .alias("Contribution_to_total_delta_pct"),
-                pl.when((pl.col("Parent_revenue_delta") < 0) & (pl.col("__parent_abs_delta") > 0))
-                .then(
-                    pl.when(pl.col("Impact_adj") < 0).then(-pl.col("Impact_adj")).otherwise(0.0)
-                    / pl.col("__parent_abs_delta")
-                )
-                .otherwise(0.0)
-                .alias("Contribution_to_decline_pct"),
-                pl.when((pl.col("Parent_revenue_delta") > 0) & (pl.col("__parent_abs_delta") > 0))
-                .then(
-                    pl.when(pl.col("Impact_adj") > 0).then(pl.col("Impact_adj")).otherwise(0.0)
-                    / pl.col("__parent_abs_delta")
-                )
-                .otherwise(0.0)
-                .alias("Contribution_to_growth_pct"),
-                contribution_label_expr.alias("Contribution_label"),
-            ]
-        )
-        .drop("__residual_allocated", "__parent_abs_delta")
-        .select(
-            [
-                "SUBSIDIARY",
-                "DIVISION",
-                "Revenue_curr_sum",
-                "Revenue_prev_sum",
-                "Spend_curr_sum",
-                "Spend_prev_sum",
-                "Revenue_delta",
-                "Revenue_yoy_pct",
-                "Spend_yoy_pct",
-                "ROAS_curr",
-                "ROAS_prev",
-                "ROAS_yoy_pct",
-                "Impact_raw",
-                "Impact_adj",
-                "Impact_raw_method",
-                "Residual_parent",
-                "Residual_applied_flag",
-                "Parent_revenue_delta",
-                "Contribution_to_total_delta_pct",
-                "Contribution_to_decline_pct",
-                "Contribution_to_growth_pct",
-                "Contribution_label",
-            ]
-        )
-    )
-
-    rows_by_sub: Dict[str, List[Dict[str, Any]]] = {}
-    for row in contribution_df.sort(["SUBSIDIARY", "DIVISION"]).to_dicts():
-        subsidiary = str(row.get("SUBSIDIARY", ""))
-        parent_delta = _to_float(row.get("Parent_revenue_delta"))
-        division_name = str(row.get("DIVISION", "DIVISION"))
-        rev_yoy = row.get("Revenue_yoy_pct")
-        roas_curr = row.get("ROAS_curr")
-        roas_yoy = row.get("ROAS_yoy_pct")
-        if parent_delta < 0:
-            summary_text = (
-                f"{division_name} 매출 {_fmt_pct(rev_yoy)} / ROAS {_fmt_roas(roas_curr)}({_fmt_pct(roas_yoy)}) "
-                f"기준, 전체 하락 기여도 {_fmt_pct(row.get('Contribution_to_decline_pct'), signed=False)}"
-            )
-        elif parent_delta > 0:
-            summary_text = (
-                f"{division_name} 매출 {_fmt_pct(rev_yoy)} / ROAS {_fmt_roas(roas_curr)}({_fmt_pct(roas_yoy)}) "
-                f"기준, 전체 성장 기여도 {_fmt_pct(row.get('Contribution_to_growth_pct'), signed=False)}"
-            )
-        else:
-            summary_text = f"{division_name} 매출 {_fmt_pct(rev_yoy)} / ROAS {_fmt_roas(roas_curr)}({_fmt_pct(roas_yoy)})"
-        row["summary_text"] = summary_text
-        rows_by_sub.setdefault(subsidiary, []).append(row)
-
-    output: List[Dict[str, Any]] = []
-    for parent in parent_rows:
-        subsidiary = str(parent.get("SUBSIDIARY", ""))
-        parent_delta = _to_float(parent.get("Parent_revenue_delta"))
-        rows = rows_by_sub.get(subsidiary, [])
-        if parent_delta < 0:
-            rows.sort(
-                key=lambda item: (
-                    -_to_float(item.get("Contribution_to_decline_pct")),
-                    -abs(_to_float(item.get("Impact_adj"))),
-                    str(item.get("DIVISION", "")),
-                )
-            )
-        elif parent_delta > 0:
-            rows.sort(
-                key=lambda item: (
-                    -_to_float(item.get("Contribution_to_growth_pct")),
-                    -abs(_to_float(item.get("Impact_adj"))),
-                    str(item.get("DIVISION", "")),
-                )
-            )
-        else:
-            rows.sort(key=lambda item: (-abs(_to_float(item.get("Impact_adj"))), str(item.get("DIVISION", ""))))
-
-        output.append(
-            {
-                "SUBSIDIARY": subsidiary,
-                "Parent_revenue_curr_sum": _to_float(parent.get("Parent_revenue_curr_sum")),
-                "Parent_revenue_prev_sum": _to_float(parent.get("Parent_revenue_prev_sum")),
-                "Parent_revenue_delta": parent_delta,
-                "Parent_revenue_yoy_pct": parent.get("Parent_revenue_yoy_pct"),
-                "rows": rows,
-            }
-        )
-    return output
+    return reporting_lmdi.division_parallel_contribution(df)
 
 
 def _final_drill_node(drill_trace: Any) -> Dict[str, Any]:
@@ -543,14 +216,14 @@ def _insight_text(
 
     channel_name = str(row.get("CHANNEL", "CHANNEL"))
     headline = (
-        f"{product_name} | 매출 {_fmt_money(product_rev_curr)}({_fmt_pct_yoy(product_rev_yoy)}) "
-        f"| 투자 {_fmt_money(product_spend_curr)}({_fmt_pct_yoy(product_spend_yoy)}) "
+        f"{product_name} | 癲ル슢????{_fmt_money(product_rev_curr)}({_fmt_pct_yoy(product_rev_yoy)}) "
+        f"| ????{_fmt_money(product_spend_curr)}({_fmt_pct_yoy(product_spend_yoy)}) "
         f"| ROAS {_fmt_roas(product_roas_curr)}({_fmt_pct_yoy(product_roas_yoy)})"
     )
     if mode_tag == "ISSUE":
-        headline = f"{headline} [하락 유발]"
+        headline = f"{headline} [??嚥??????ル늉筌?"
     elif mode_tag in {"IMPROVE", "DEFENSE"} and (channel_rev_yoy is not None and channel_rev_yoy < 0):
-        headline = f"{headline} [채널 하락 상쇄]"
+        headline = f"{headline} [癲???紐???嚥??????ㅼ굡??"
 
     division_spend_curr = _to_float(division_row.get("Spend_curr_sum"))
     division_spend_prev = _to_float(division_row.get("Spend_prev_sum"))
@@ -660,75 +333,75 @@ def _insight_text(
     tag = str(row.get("tag", "") or "").upper()
 
     channel_text = (
-        f"1) 채널 {channel_name}: 매출 {_fmt_money(channel_rev_curr)}({_fmt_pct_yoy(channel_rev_yoy)}), "
-        f"투자 {_fmt_money(channel_spend_curr)}({_fmt_pct_yoy(channel_spend_yoy)}), "
+        f"1) 癲???紐?{channel_name}: 癲ル슢????{_fmt_money(channel_rev_curr)}({_fmt_pct_yoy(channel_rev_yoy)}), "
+        f"????{_fmt_money(channel_spend_curr)}({_fmt_pct_yoy(channel_spend_yoy)}), "
         f"ROAS {_fmt_roas(channel_roas_curr)}({_fmt_pct_yoy(channel_roas_yoy)}), "
         f"{contribution_rate_label} {_fmt_pct(channel_direct_pct, signed=False)}"
     )
     division_text = (
-        f"2) BU {division_name}: 채널 내 매출 비중 {_fmt_pct(division_rev_share, signed=False)}, "
-        f"매출 {_fmt_money(division_rev_curr)}({_fmt_pct_yoy(division_rev_yoy)}), "
-        f"투자 {_fmt_money(division_spend_curr)}({_fmt_pct_yoy(division_spend_yoy)}), "
+        f"2) BU {division_name}: 癲???紐???癲ル슢????????룔뀋?{_fmt_pct(division_rev_share, signed=False)}, "
+        f"癲ル슢????{_fmt_money(division_rev_curr)}({_fmt_pct_yoy(division_rev_yoy)}), "
+        f"????{_fmt_money(division_spend_curr)}({_fmt_pct_yoy(division_spend_yoy)}), "
         f"ROAS {_fmt_roas(division_roas_curr)}({_fmt_pct_yoy(division_roas_yoy)}), "
         f"{contribution_rate_label} {_fmt_pct(division_direct_pct, signed=False)}"
     )
     product_text = (
-        f"3) 제품 {product_name}: {contribution_rate_label} {_fmt_pct(product_direct_pct, signed=False)}, "
-        f"핵심 지표 {driver}"
+        f"3) ???? {product_name}: {contribution_rate_label} {_fmt_pct(product_direct_pct, signed=False)}, "
+        f"?????癲ル슣????{driver}"
     )
     if tag == "NEW":
         evidence_text = (
-            f"4) 지표 근거: 신규 항목으로 전년 기준이 부족해 YoY/dlog 신뢰도는 낮음. "
-            f"현재 {driver} {_fmt_driver_metric(driver, product_driver_curr)}, "
-            f"BU {driver} {_fmt_driver_metric(driver, division_driver_curr)} 기준으로 관찰."
+            f"4) 癲ル슣?????????琉? ???ル㎦????????⑥????ш끽維????れ삀??????딅텑??釉뚰?轅대쑏?YoY/dlog ???ル굔??ш끽維獒????? "
+            f"??ш끽維??{driver} {_fmt_driver_metric(driver, product_driver_curr)}, "
+            f"BU {driver} {_fmt_driver_metric(driver, division_driver_curr)} ??れ삀?????⑥?????굿癲?"
         )
         interpretation_text = (
-            "5) 해석: 신규 항목은 원인 확정보다 초기 안정화(클릭·전환·매출 추세) 모니터링이 우선."
+            "5) ???⑤똾留? ???ル㎦??????? ??????嶺뚮Ĳ???륁녃域????縕?猿녿뎨????源놁젳???????용뿭???ш낄援?濡γ뀋??뱀떴???맞???⑤베毓?? 癲ル슢?꾤땟?????ㅻ깹??????Β?띾쭡."
         )
     elif tag == "LOW_VOL":
         evidence_text = (
-            f"4) 지표 근거: 저볼륨 구간으로 YoY 변동성이 큼. "
-            f"{driver} {_fmt_driver_metric(driver, product_driver_curr)} vs BU {driver} {_fmt_driver_metric(driver, division_driver_curr)} 참고."
+            f"4) 癲ル슣?????????琉? ???怨뚮옩???????쐠????⑥??YoY ?怨뚮뼚?????쀫렰???? "
+            f"{driver} {_fmt_driver_metric(driver, product_driver_curr)} vs BU {driver} {_fmt_driver_metric(driver, division_driver_curr)} 癲ル슔?蹂앸듋??"
         )
         interpretation_text = (
-            "5) 해석: 저볼륨 구간은 원인 단정 대신 데이터 누적 후 재판단이 적절."
+            "5) ???⑤똾留? ???怨뚮옩???????쐠??? ?????????????????Β??????ш끽維??????????쒒????ㅼ굣??"
         )
     else:
         evidence_text = (
-            f"4) 지표 근거: {driver} {_fmt_driver_metric(driver, product_driver_curr)}"
+            f"4) 癲ル슣?????????琉? {driver} {_fmt_driver_metric(driver, product_driver_curr)}"
             f"({_fmt_pct_yoy(driver_yoy)}), BU {driver} {_fmt_driver_metric(driver, division_driver_curr)}"
-            f"({_fmt_pct_yoy(division_driver_yoy)}), YoY 격차 {_fmt_pp(driver_gap_pp)}. "
+            f"({_fmt_pct_yoy(division_driver_yoy)}), YoY ?濡る큸泳?μ쾸?{_fmt_pp(driver_gap_pp)}. "
             f"|dlog| {driver} {driver_dlog_abs:.3f} (CVR {dlog_cvr_abs:.3f}, AOV {dlog_aov_abs:.3f}, CPC {dlog_cpc_abs:.3f})"
         )
 
         if signal_max_abs < 0.05:
-            interpretation_text = "5) 해석: 지표 신호 강도가 약해 원인 단정보다 추세 관찰이 우선."
+            interpretation_text = "5) ???⑤똾留? 癲ル슣???????レ챺繹???좊즴甕곗쥉?닺쥈?苡? ???????????????륁녃域?????⑤베毓?????굿癲ル슓???????Β?띾쭡."
         elif driver == "CPC":
             if mode_tag == "ISSUE":
                 interpretation_text = (
-                    "5) 해석: 유입 효율 이슈 신호. 보조 확인은 CTR(IMP/CLICK), 클릭 볼륨, 유입단가 추세."
+                    "5) ???⑤똾留? ???モ섋굢????쒙쭗????⑤８? ???レ챺繹? ?怨뚮옖????嶺뚮Ĳ?됮?? CTR(IMP/CLICK), ??????怨뚮옩??? ???モ섋굢??? ??⑤베毓??"
                 )
             else:
                 interpretation_text = (
-                    "5) 해석: 유입 효율 개선 신호. 보조 확인은 CTR(IMP/CLICK) 유지, 클릭 볼륨 유지 여부."
+                    "5) ???⑤똾留? ???モ섋굢????쒙쭗???좊즵獒뺣돀?????レ챺繹? ?怨뚮옖????嶺뚮Ĳ?됮?? CTR(IMP/CLICK) ???, ??????怨뚮옩?????? ???."
                 )
         elif driver == "CVR":
             if mode_tag == "ISSUE":
                 interpretation_text = (
-                    "5) 해석: 전환 효율 이슈 신호. 유입 트래픽 품질(키워드/오디언스/랜딩 정합성) 점검 필요."
+                    "5) ???⑤똾留? ??ш낄援?????쒙쭗????⑤８? ???レ챺繹? ???モ섋굢??嶺뚮ㅎ???????源녿뼥(???源낆맫??????쇨틣?嶺뚮ㅎ?ц짆???筌먲퐢???嶺뚮쮳??? ??? ??ш끽維??"
                 )
             else:
                 interpretation_text = (
-                    "5) 해석: 전환 효율 개선 신호. 유입 트래픽 품질 개선 및 랜딩/오퍼 적합도 개선 가능성."
+                    "5) ???⑤똾留? ??ш낄援?????쒙쭗???좊즵獒뺣돀?????レ챺繹? ???モ섋굢??嶺뚮ㅎ???????源녿뼥 ??좊즵獒뺣돀??????筌먲퐢??????됰군 ???ㅺ강?????좊즵獒뺣돀????좊읈????묐빝?"
                 )
         else:
             if mode_tag == "ISSUE":
                 interpretation_text = (
-                    "5) 해석: AOV 이슈는 유입 트래픽 믹스(저의도/저가 유입 비중) 문제 신호."
+                    "5) ???⑤똾留? AOV ???⑤８??????モ섋굢??嶺뚮ㅎ????雅?퍔瑗???????嚥▲꺃??????좊읈? ???モ섋굢?????룔뀋? ???뽮덫?????レ챺繹?"
                 )
             else:
                 interpretation_text = (
-                    "5) 해석: AOV 개선은 고의도/고가 상품 유입 비중 개선 신호."
+                    "5) ???⑤똾留? AOV ??좊즵獒뺣돀??? ??關履?????關履? ???ㅺ강? ???モ섋굢?????룔뀋???좊즵獒뺣돀?????レ챺繹?"
                 )
 
     detail = "\n".join([channel_text, division_text, product_text, evidence_text, interpretation_text])
@@ -798,23 +471,22 @@ def _to_report_rows(
             {"rank": 1, "pool_size": 1},
         )
         if mode_tag == "ISSUE":
-            contribution_type = "하락 기여율"
+            contribution_type = "하락 기여"
         else:
-            contribution_type = "개선 기여율"
+            contribution_type = "개선 기여"
 
         caution = ""
         tag = str(row.get("tag", "") or "")
         if tag == "NEW":
-            caution = " 신규(tag=NEW)라 전년 기저효과를 함께 확인하세요."
+            caution = " 신규(tag=NEW)로 연속 기간 성과를 추가 확인하세요."
         elif tag == "LOW_VOL":
             caution = " 저볼륨(tag=LOW_VOL)이라 변동성 해석에 주의가 필요합니다."
 
         why_selected_text = (
-            f"{row.get('CHANNEL')}/{row.get('DIVISION')} 내 {rank_info['pool_size']}개 제품 중 "
-            f"{rank_info['rank']}위, {contribution_type} { _fmt_pct(impact_contribution_pct, signed=False) } "
-            f"기준으로 선정.{caution}"
+            f"{row.get('CHANNEL')}/{row.get('DIVISION')} 내 {rank_info['pool_size']}개 상품 중 "
+            f"{rank_info['rank']}위, {contribution_type} {_fmt_pct(impact_contribution_pct, signed=False)} "
+            f"기여율로 선정.{caution}"
         )
-
         report_rows.append(
             {
                 "diagnosis_subsidiary": row.get("diagnosis_subsidiary"),
@@ -852,101 +524,11 @@ def _to_report_rows(
 
 
 def _top3_by_subsidiary(rows: List[Dict[str, Any]], descending: bool) -> Dict[str, List[Dict[str, Any]]]:
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for row in rows:
-        sub = str(row.get("diagnosis_subsidiary", "UNKNOWN"))
-        grouped.setdefault(sub, []).append(row)
-
-    for sub in grouped:
-        # Prefer percentage contribution in report rows; fall back to absolute impact amount.
-        def _metric(item: Dict[str, Any]) -> float:
-            pct = item.get("impact_contribution_pct")
-            if pct is not None:
-                return _to_float(pct)
-            raw = item.get("impact_adj")
-            if raw is None:
-                raw = item.get("Impact_adj")
-            return abs(_to_float(raw))
-
-        def _scope_parts(item: Dict[str, Any]) -> tuple[str, str, str]:
-            path = item.get("path", {})
-            if not isinstance(path, dict):
-                path = {}
-            channel = str(path.get("CHANNEL", item.get("CHANNEL", "")))
-            division = str(path.get("DIVISION", item.get("DIVISION", "")))
-            product = str(path.get("PRODUCT", item.get("PRODUCT", "")))
-            return channel, division, product
-
-        def _has_yoy_basis(item: Dict[str, Any]) -> bool:
-            pairs = [("CVR_curr", "CVR_prev"), ("AOV_curr", "AOV_prev"), ("CPC_curr", "CPC_prev")]
-            for curr_key, prev_key in pairs:
-                curr = item.get(curr_key)
-                prev = item.get(prev_key)
-                if curr is None or prev is None:
-                    continue
-                prev_val = _to_float(prev)
-                if prev_val <= 0:
-                    continue
-                curr_val = _to_float(curr)
-                if _safe_pct_change(curr_val, prev_val) is not None:
-                    return True
-            return False
-
-        def _is_actionable(item: Dict[str, Any]) -> bool:
-            pct = item.get("impact_contribution_pct")
-            low_impact = pct is None or _to_float(pct) < MIN_TOPIC_IMPACT_PCT
-            return _has_yoy_basis(item) or not low_impact
-
-        candidates = [item for item in grouped[sub] if _is_actionable(item)]
-
-        ordered = sorted(
-            candidates,
-            key=lambda row: (
-                -_metric(row) if descending else _metric(row),
-                *_scope_parts(row),
-            )
-        )
-        selected: List[Dict[str, Any]] = []
-        seen_triplets: set[tuple[str, str, str]] = set()
-        used_channel_bu: set[tuple[str, str]] = set()
-        used_channels: set[str] = set()
-        used_bus: set[str] = set()
-
-        def _pick(stage: str) -> None:
-            for item in ordered:
-                if len(selected) >= 3:
-                    return
-                channel, division, product = _scope_parts(item)
-                triplet = (channel, division, product)
-                channel_bu = (channel, division)
-                if triplet in seen_triplets:
-                    continue
-
-                is_new_pair = channel_bu not in used_channel_bu
-                is_new_channel = channel not in used_channels
-                is_new_bu = division not in used_bus
-
-                if stage == "strict" and not (is_new_pair and is_new_channel and is_new_bu):
-                    continue
-                if stage == "semi" and not (is_new_pair and (is_new_channel or is_new_bu)):
-                    continue
-                if stage == "pair" and not is_new_pair:
-                    continue
-
-                selected.append(item)
-                seen_triplets.add(triplet)
-                used_channel_bu.add(channel_bu)
-                used_channels.add(channel)
-                used_bus.add(division)
-
-        # Diversification priority:
-        # 1) new channel + new BU, 2) at least one new among channel/BU, 3) no duplicate channel/BU pair, 4) fill.
-        _pick("strict")
-        _pick("semi")
-        _pick("pair")
-        _pick("fill")
-        grouped[sub] = selected[:3]
-    return grouped
+    return reporting_selectors.top3_by_subsidiary(
+        rows,
+        descending=descending,
+        min_topic_impact_pct=MIN_TOPIC_IMPACT_PCT,
+    )
 
 
 def _subsidiary_perf_map(df: pl.DataFrame) -> Dict[str, Dict[str, Any]]:
@@ -997,60 +579,15 @@ def _choose_subsidiary_mode(
     issues_by_sub: Dict[str, List[Dict[str, Any]]],
     improves_by_sub: Dict[str, List[Dict[str, Any]]],
 ) -> tuple[str, List[Dict[str, Any]]]:
-    rev_delta = _to_float(perf.get("rev_delta"))
-    issues = issues_by_sub.get(subsidiary, [])
-    improves = improves_by_sub.get(subsidiary, [])
-
-    if rev_delta < 0:
-        if issues:
-            return "ISSUE", issues
-        return "IMPROVE", improves
-
-    # Flat or positive trend: prefer improve-topics unless unavailable.
-    if improves:
-        return "IMPROVE", improves
-    if issues:
-        return "ISSUE", issues
-    return "IMPROVE", improves
+    return reporting_selectors.choose_subsidiary_mode(subsidiary, perf, issues_by_sub, improves_by_sub)
 
 
 def _subsidiary_overall_comment(subsidiary: str, perf: Dict[str, Any], mode: str) -> str:
-    rev_delta = _to_float(perf.get("rev_delta"))
-    if rev_delta < 0:
-        trend = "하락"
-    elif rev_delta > 0:
-        trend = "개선"
-    else:
-        trend = "보합"
-
-    mode_kr = "이슈" if mode == "ISSUE" else "개선"
-    return (
-        f"{subsidiary} 총매출 {_fmt_money(perf.get('rev_curr'))}({_fmt_pct_yoy(perf.get('rev_yoy'))})로 {trend}. "
-        f"투자 {_fmt_money(perf.get('spend_curr'))}({_fmt_pct_yoy(perf.get('spend_yoy'))}), "
-        f"ROAS {_fmt_roas(perf.get('roas_curr'))}({_fmt_pct_yoy(perf.get('roas_yoy'))}). "
-        f"이번 리포트는 {mode_kr} Top3 기준."
-    )
+    return reporting_rendering.subsidiary_overall_comment(subsidiary, perf, mode)
 
 
 def _subsidiary_detail_comment(mode: str, top3: List[Dict[str, Any]]) -> str:
-    if not top3:
-        return "선별된 Top3가 없습니다."
-
-    contrib_label = "하락 기여율" if mode == "ISSUE" else "개선 기여율"
-    lines: List[str] = []
-    for idx, row in enumerate(top3, start=1):
-        path = row.get("path", {})
-        if not isinstance(path, dict):
-            path = {}
-        channel = str(path.get("CHANNEL", ""))
-        division = str(path.get("DIVISION", ""))
-        product = str(path.get("PRODUCT", ""))
-        contrib = str(row.get("impact_contribution_text", "N/A"))
-        driver = str(row.get("primary_driver", "NONE"))
-        lines.append(
-            f"{idx}) {channel}/{division}/{product}: {contrib_label} {contrib}, 주요 지표 {driver}"
-        )
-    return " | ".join(lines)
+    return reporting_rendering.subsidiary_detail_comment(mode, top3)
 
 
 def _build_subsidiary_reports(
