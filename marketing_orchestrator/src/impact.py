@@ -223,24 +223,27 @@ class ImpactEngine:
         impact_sum = self._to_float(impact_sum_raw)
         residual = parent_delta - impact_sum
 
-        target_series = (
-            child_imp.with_columns(pl.col("Impact_raw").abs().alias("__abs"))
-            .sort(["__abs", "__path_key"], descending=[True, False])
-            .select("__path_key")
-            .to_series(0)
-        )
-        target_key = target_series[0] if len(target_series) > 0 else ""
+        child_count = child_imp.height
+        abs_impact_sum_raw = child_imp.select(pl.col("Impact_raw").abs().sum()).to_series(0)[0]
+        abs_impact_sum = self._to_float(abs_impact_sum_raw)
+        if child_count <= 0:
+            residual_alloc_expr = pl.lit(0.0)
+        elif abs_impact_sum > 0:
+            residual_alloc_expr = (pl.col("Impact_raw").abs() / pl.lit(abs_impact_sum)) * pl.lit(residual)
+        else:
+            residual_alloc_expr = pl.lit(residual / child_count)
 
         child_adj = child_imp.with_columns(
             [
                 pl.lit(residual).alias("Residual_parent"),
-                (pl.col("__path_key") == pl.lit(target_key)).alias("Residual_applied_flag"),
-                pl.when(pl.col("__path_key") == pl.lit(target_key))
-                .then(pl.col("Impact_raw") + pl.lit(residual))
-                .otherwise(pl.col("Impact_raw"))
-                .alias("Impact_adj"),
+                residual_alloc_expr.alias("__residual_allocated"),
             ]
-        )
+        ).with_columns(
+            [
+                (pl.col("__residual_allocated").abs() > pl.lit(1e-12)).alias("Residual_applied_flag"),
+                (pl.col("Impact_raw") + pl.col("__residual_allocated")).alias("Impact_adj"),
+            ]
+        ).drop("__residual_allocated")
 
         abs_sum_value = child_adj.select(pl.col("Impact_adj").abs().sum()).to_series(0)[0]
         abs_sum = self._to_float(abs_sum_value)

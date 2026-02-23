@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
@@ -54,8 +56,22 @@ PREFERRED_COLUMN_SETS: list[list[str]] = [
     LONG_COLUMNS_YEAR_ALT_MIN,
     ENGINE_COLUMNS,
 ]
-DEFAULT_CURR_YEAR = 2026
-DEFAULT_PREV_YEAR = 2025
+DEFAULT_CURR_YEAR = date.today().year
+DEFAULT_PREV_YEAR = DEFAULT_CURR_YEAR - 1
+
+
+def _parse_error_threshold() -> float:
+    raw = os.getenv("ROAS_PARSE_ERROR_THRESHOLD", "0.01")
+    try:
+        threshold = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid ROAS_PARSE_ERROR_THRESHOLD: {raw}") from exc
+    if threshold < 0 or threshold > 1:
+        raise ValueError(f"ROAS_PARSE_ERROR_THRESHOLD must be in [0, 1], got {threshold}")
+    return threshold
+
+
+METRIC_PARSE_ERROR_THRESHOLD = _parse_error_threshold()
 
 
 def _import_openpyxl() -> tuple[Any, Any]:
@@ -187,15 +203,56 @@ def _year_expr(column_name: str) -> pl.Expr:
     )
 
 
-def _metric_expr(column_name: str) -> pl.Expr:
+def _metric_text_expr(column_name: str) -> pl.Expr:
+    return pl.col(column_name).cast(pl.Utf8, strict=False).str.strip_chars()
+
+
+def _metric_parsed_expr(column_name: str) -> pl.Expr:
+    return _metric_text_expr(column_name).str.replace_all(",", "").cast(pl.Float64, strict=False)
+
+
+def _metric_parse_error_expr(column_name: str) -> pl.Expr:
+    text_expr = _metric_text_expr(column_name)
+    parsed_expr = _metric_parsed_expr(column_name)
     return (
-        pl.col(column_name)
-        .cast(pl.Utf8, strict=False)
-        .str.replace_all(",", "")
-        .cast(pl.Float64, strict=False)
-        .fill_null(0.0)
-        .alias(column_name)
+        (text_expr.is_not_null() & (text_expr != "") & parsed_expr.is_null())
+        .cast(pl.UInt32)
+        .alias(f"__parse_error_{column_name}")
     )
+
+
+def _metric_expr(column_name: str) -> pl.Expr:
+    return _metric_parsed_expr(column_name).fill_null(0.0).alias(column_name)
+
+
+def _validate_metric_parse_errors(
+    df: pl.DataFrame,
+    metric_columns: Sequence[str],
+    context: str,
+    threshold: float = METRIC_PARSE_ERROR_THRESHOLD,
+) -> None:
+    if df.is_empty() or threshold <= 0:
+        return
+    targets = [column for column in metric_columns if column in df.columns]
+    if not targets:
+        return
+
+    checks_df = df.select([_metric_parse_error_expr(column) for column in targets])
+    row_count = int(df.height)
+    failures: list[str] = []
+    for column in targets:
+        check_col = f"__parse_error_{column}"
+        count_value = checks_df.select(pl.col(check_col).sum()).to_series(0)[0]
+        parse_error_count = int(count_value or 0)
+        parse_error_ratio = parse_error_count / row_count if row_count > 0 else 0.0
+        if parse_error_ratio > threshold:
+            failures.append(f"{column}={parse_error_ratio:.2%} ({parse_error_count}/{row_count})")
+
+    if failures:
+        joined = ", ".join(failures)
+        raise ValueError(
+            f"Data quality check failed in {context}: metric parse error ratio exceeds {threshold:.2%} ({joined})"
+        )
 
 
 def _int_expr(column_name: str) -> pl.Expr:
@@ -274,8 +331,15 @@ def _normalize_wide_engine_frame(df: pl.DataFrame) -> pl.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
+    selected = df.select(ENGINE_COLUMNS)
+    _validate_metric_parse_errors(
+        selected,
+        metric_columns=ENGINE_METRIC_COLUMNS,
+        context="wide_engine_frame",
+    )
+
     normalized = (
-        df.select(ENGINE_COLUMNS)
+        selected
         .with_columns(
             [_dimension_expr(dim) for dim in DIMENSIONS]
             + [pl.col(metric).cast(pl.Float64, strict=False).fill_null(0.0).alias(metric) for metric in ENGINE_METRIC_COLUMNS]
@@ -305,6 +369,11 @@ def _normalize_long_frame(df: pl.DataFrame) -> pl.DataFrame:
         selected_columns.append(day_column)
 
     selected = renamed.select(selected_columns)
+    _validate_metric_parse_errors(
+        selected,
+        metric_columns=METRICS,
+        context="long_engine_frame",
+    )
 
     exprs = (
         [_dimension_expr(dim) for dim in DIMENSIONS]
