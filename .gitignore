@@ -1,0 +1,6 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+marketing_orchestrator/data/
+marketing_orchestrator/output/
