@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import polars as pl
 
@@ -91,6 +91,61 @@ class RootCauseEngine:
 
     def _aggregate_campaign(self, df: pl.DataFrame) -> pl.DataFrame:
         return df.group_by(self.DIMENSIONS).agg(self._sum_aggregations()).sort(self.DIMENSIONS)
+
+    def _to_rca_map(self, rca_df: pl.DataFrame) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
+        return {self._campaign_key(row): row for row in rca_df.to_dicts()}
+
+    def build_mode_maps(self, df: pl.DataFrame) -> Dict[str, Dict[Tuple[Any, ...], Dict[str, Any]]]:
+        """Precompute RCA lookup maps for ISSUE/IMPROVE from one campaign aggregation."""
+        self._validate_schema(df)
+        agg_df = self._aggregate_campaign(df)
+        issue_map = self._to_rca_map(self._compute_rca_table(agg_df, "ISSUE"))
+        improve_map = self._to_rca_map(self._compute_rca_table(agg_df, "IMPROVE"))
+        return {"ISSUE": issue_map, "IMPROVE": improve_map}
+
+    def _join_campaign_rca(
+        self,
+        top_campaigns: List[Dict[str, Any]],
+        mode_upper: str,
+        rca_map: Mapping[Tuple[Any, ...], Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        campaigns_with_rca: List[Dict[str, Any]] = []
+        for campaign in top_campaigns:
+            item = dict(campaign)
+            key = self._campaign_key(campaign)
+            rca = rca_map.get(key)
+
+            if rca is None:
+                item["primary_driver"] = "NONE"
+                item["tag"] = "UNDEFINED"
+                item["dlog_CVR"] = None
+                item["dlog_AOV"] = None
+                item["dlog_CPC"] = None
+                item["total_dlog_roas"] = None
+                item["CPC_curr"] = None
+                item["CPC_prev"] = None
+                item["CVR_curr"] = None
+                item["CVR_prev"] = None
+                item["AOV_curr"] = None
+                item["AOV_prev"] = None
+                item["ROAS_curr"] = None
+                item["ROAS_prev"] = None
+            else:
+                for field in self.SUM_METRICS + self.RCA_FIELDS:
+                    item[field] = rca.get(field)
+
+            campaigns_with_rca.append(item)
+
+        if mode_upper == "ISSUE":
+            campaigns_with_rca.sort(
+                key=lambda row: (self._to_float(row.get("Impact_adj")),) + self._dims_sort_key(row)
+            )
+        else:
+            campaigns_with_rca.sort(
+                key=lambda row: (-self._to_float(row.get("Impact_adj")),) + self._dims_sort_key(row)
+            )
+
+        return {"campaigns_with_rca": campaigns_with_rca}
 
     def _compute_rca_table(self, agg_df: pl.DataFrame, mode: str) -> pl.DataFrame:
         base = (
@@ -187,6 +242,7 @@ class RootCauseEngine:
         df: pl.DataFrame,
         top_campaigns: List[Dict[str, Any]],
         mode: str,
+        rca_map: Mapping[Tuple[Any, ...], Dict[str, Any]] | None = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Run RCA for selected campaigns."""
         mode_upper = mode.upper()
@@ -195,45 +251,10 @@ class RootCauseEngine:
         if not top_campaigns:
             return {"campaigns_with_rca": []}
 
-        self._validate_schema(df)
-        agg_df = self._aggregate_campaign(df)
-        rca_df = self._compute_rca_table(agg_df, mode_upper)
-        rca_map = {self._campaign_key(row): row for row in rca_df.to_dicts()}
-
-        campaigns_with_rca: List[Dict[str, Any]] = []
-        for campaign in top_campaigns:
-            item = dict(campaign)
-            key = self._campaign_key(campaign)
-            rca = rca_map.get(key)
-
-            if rca is None:
-                item["primary_driver"] = "NONE"
-                item["tag"] = "UNDEFINED"
-                item["dlog_CVR"] = None
-                item["dlog_AOV"] = None
-                item["dlog_CPC"] = None
-                item["total_dlog_roas"] = None
-                item["CPC_curr"] = None
-                item["CPC_prev"] = None
-                item["CVR_curr"] = None
-                item["CVR_prev"] = None
-                item["AOV_curr"] = None
-                item["AOV_prev"] = None
-                item["ROAS_curr"] = None
-                item["ROAS_prev"] = None
-            else:
-                for field in self.SUM_METRICS + self.RCA_FIELDS:
-                    item[field] = rca.get(field)
-
-            campaigns_with_rca.append(item)
-
-        if mode_upper == "ISSUE":
-            campaigns_with_rca.sort(
-                key=lambda row: (self._to_float(row.get("Impact_adj")),) + self._dims_sort_key(row)
-            )
+        if rca_map is None:
+            mode_maps = self.build_mode_maps(df)
+            mode_map = mode_maps[mode_upper]
         else:
-            campaigns_with_rca.sort(
-                key=lambda row: (-self._to_float(row.get("Impact_adj")),) + self._dims_sort_key(row)
-            )
+            mode_map = rca_map
 
-        return {"campaigns_with_rca": campaigns_with_rca}
+        return self._join_campaign_rca(top_campaigns, mode_upper, mode_map)

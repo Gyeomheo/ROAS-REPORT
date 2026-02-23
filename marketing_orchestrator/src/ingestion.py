@@ -102,42 +102,7 @@ def _read_excel_polars(path: Path, **kwargs: Any) -> Any:
         return pl.read_excel(path, **kwargs)  # type: ignore[arg-type]
 
 
-def _read_with_polars(path: Path, preferred_sheet: str, target_sheet: str) -> pl.DataFrame:
-    if not hasattr(pl, "read_excel"):
-        raise RuntimeError("polars.read_excel is not available in this environment.")
-
-    tried: list[str] = []
-    for sheet_name in [target_sheet, preferred_sheet]:
-        if sheet_name in tried:
-            continue
-        tried.append(sheet_name)
-        for columns in PREFERRED_COLUMN_SETS:
-            try:
-                frame = _read_excel_polars(path, sheet_name=sheet_name, columns=columns)
-                if isinstance(frame, dict):
-                    if preferred_sheet in frame:
-                        return frame[preferred_sheet]
-                    first_key = next(iter(frame.keys()), None)
-                    if first_key is None:
-                        return pl.DataFrame()
-                    return frame[first_key]
-                return frame
-            except Exception:
-                continue
-        try:
-            frame = _read_excel_polars(path, sheet_name=sheet_name)
-            if isinstance(frame, dict):
-                if preferred_sheet in frame:
-                    return frame[preferred_sheet]
-                first_key = next(iter(frame.keys()), None)
-                if first_key is None:
-                    return pl.DataFrame()
-                return frame[first_key]
-            return frame
-        except Exception:
-            continue
-
-    frame = _read_excel_polars(path)
+def _frame_from_polars_result(frame: Any, preferred_sheet: str) -> pl.DataFrame:
     if isinstance(frame, dict):
         if preferred_sheet in frame:
             return frame[preferred_sheet]
@@ -146,6 +111,37 @@ def _read_with_polars(path: Path, preferred_sheet: str, target_sheet: str) -> pl
             return pl.DataFrame()
         return frame[first_key]
     return frame
+
+
+def _read_with_polars(path: Path, preferred_sheet: str, target_sheet: str) -> pl.DataFrame:
+    if not hasattr(pl, "read_excel"):
+        raise RuntimeError("polars.read_excel is not available in this environment.")
+
+    tried: list[str] = []
+    for sheet_name in [target_sheet, preferred_sheet]:
+        if not sheet_name or sheet_name in tried:
+            continue
+        tried.append(sheet_name)
+
+        try:
+            frame = _read_excel_polars(path, sheet_name=sheet_name)
+            return _frame_from_polars_result(frame, preferred_sheet)
+        except Exception:
+            pass
+
+        for columns in PREFERRED_COLUMN_SETS:
+            try:
+                frame = _read_excel_polars(path, sheet_name=sheet_name, columns=columns)
+                return _frame_from_polars_result(frame, preferred_sheet)
+            except Exception:
+                continue
+
+    try:
+        frame = _read_excel_polars(path, sheet_name=preferred_sheet)
+        return _frame_from_polars_result(frame, preferred_sheet)
+    except Exception:
+        frame = _read_excel_polars(path)
+        return _frame_from_polars_result(frame, preferred_sheet)
 
 
 def _read_with_openpyxl(path: Path, target_sheet: str, preferred_sheet: str) -> pl.DataFrame:
@@ -453,11 +449,10 @@ def read_input_excel(
     if not excel_path.exists():
         raise FileNotFoundError(f"Input Excel file not found: {excel_path}")
 
-    target_sheet = _select_sheet_name(excel_path, preferred_sheet)
-
     try:
-        raw_df = _read_with_polars(excel_path, preferred_sheet, target_sheet)
+        raw_df = _read_with_polars(excel_path, preferred_sheet, preferred_sheet)
     except Exception:
+        target_sheet = _select_sheet_name(excel_path, preferred_sheet)
         raw_df = _read_with_openpyxl(excel_path, target_sheet, preferred_sheet)
 
     engine_df, meta = _to_engine_frame(

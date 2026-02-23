@@ -1,4 +1,4 @@
-﻿"""HTML report generator for issue + replication topics by SUBSIDIARY."""
+﻿"""HTML report generator for issue + driver topics by SUBSIDIARY."""
 
 from __future__ import annotations
 
@@ -385,7 +385,7 @@ def _yoy_css_class(metric_name: str, value: float | None) -> str:
         return "yoy-neutral"
 
     key = str(metric_name).lower()
-    if key in {"cost", "cpc"}:
+    if key == "cpc":
         return "yoy-pos" if value < 0 else "yoy-neg"
     return "yoy-pos" if value > 0 else "yoy-neg"
 
@@ -596,7 +596,7 @@ def _build_topic_html(
     detail_lines.append(f"확인: {checklist}")
     detail_html = "<br>".join(escape(line) for line in detail_lines if line)
 
-    topic_name = "Issue" if mode == "ISSUE" else "Replication"
+    topic_name = "Issue" if mode == "ISSUE" else "Driver"
     return (
         "<article class=\"topic\">"
         f"<h4>{topic_name} {idx}: {escape(channel)} / {escape(bu)} / {escape(product)}</h4>"
@@ -614,6 +614,107 @@ def _build_topic_html(
         f"<p class=\"detail\"><strong>상세 코멘트:</strong> {detail_html}</p>"
         "</article>"
     )
+
+
+def _safe_head_text(value: Any) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if not text:
+        return ""
+    if ":" in text:
+        text = text.split(":", 1)[1].strip()
+    return text
+
+
+def _lmdi_driver_for_sub(summary: Dict[str, Any], sub: str, mode: str, channel: str = "") -> str:
+    target_label = "DECLINE_DRIVER" if mode == "ISSUE" else "GROWTH_DRIVER"
+    target_key = "Contribution_to_decline_pct" if mode == "ISSUE" else "Contribution_to_growth_pct"
+    lead_text = "하락 동인" if mode == "ISSUE" else "성장 동인"
+
+    best_division = ""
+    best_pct = 0.0
+    blocks = summary.get("division_parallel_contribution", [])
+    if not isinstance(blocks, list):
+        return "LMDI 상위 동인 분산"
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("SUBSIDIARY", "")) != sub:
+            continue
+
+        rows = block.get("rows", [])
+        if not isinstance(rows, list):
+            break
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("Contribution_label", "")).upper() != target_label:
+                continue
+            pct = _to_float(row.get(target_key))
+            if pct > best_pct:
+                best_pct = pct
+                best_division = str(row.get("DIVISION", "")) or "N/A"
+        break
+
+    channel_name = str(channel or "").strip()
+    if best_division and best_pct > 0:
+        if channel_name:
+            return f"LMDI {lead_text} {channel_name}의 {best_division}({_fmt_pct(best_pct, signed=False)})"
+        return f"LMDI {lead_text} {best_division}({_fmt_pct(best_pct, signed=False)})"
+    return "LMDI 상위 동인 분산"
+
+
+def _short_now_what(mode: str, driver: str) -> str:
+    mode_name = str(mode or "").upper()
+    driver_name = str(driver or "").upper()
+
+    if mode_name == "ISSUE":
+        if driver_name == "CVR":
+            return "전환지표(CVR) 파악"
+        if driver_name == "CPC":
+            return "유입단가(CPC) 통제"
+        if driver_name == "AOV":
+            return "객단가(AOV) 파악"
+        return "핵심지표 원인 파악"
+
+    if driver_name == "CVR":
+        return "전환지표(CVR) 확장"
+    if driver_name == "CPC":
+        return "유입단가(CPC) 효율 유지"
+    if driver_name == "AOV":
+        return "객단가(AOV) 확장"
+    return "핵심지표 성과 확장"
+
+
+def _subsidiary_summary_line(
+    sub: str,
+    mode: str,
+    metrics: Dict[str, Any],
+    summary: Dict[str, Any],
+    selected_topics: List[Dict[str, Any]],
+) -> str:
+    what = (
+        f"What: 매출 {_fmt_money(metrics.get('revenue_curr'))}({_fmt_pct_yoy(metrics.get('revenue_yoy'))}), "
+        f"ROAS {_fmt_roas(metrics.get('roas_curr'))}({_fmt_pct_yoy(metrics.get('roas_yoy'))})"
+    )
+
+    top_channel = ""
+    if selected_topics:
+        top_path = selected_topics[0].get("path", {})
+        if isinstance(top_path, dict):
+            top_channel = str(top_path.get("CHANNEL", "")).strip()
+
+    so_what = f"So What: {_lmdi_driver_for_sub(summary, sub, mode, top_channel)}"
+
+    primary_driver = ""
+    if selected_topics:
+        primary_driver = str(selected_topics[0].get("primary_driver", "")).upper()
+    if not primary_driver:
+        primary_driver = _driver_from_metrics(metrics, mode)
+    now_what = f"Now What: {_short_now_what(mode, primary_driver)}"
+
+    return f"{sub} | {what} | {so_what} | {now_what}"
 
 
 def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFrame) -> None:
@@ -654,22 +755,16 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
             if sub_name and mode_name in {"ISSUE", "IMPROVE"}:
                 mode_by_sub[sub_name] = mode_name
 
-    perf_rows = (
-        df.group_by(["SUBSIDIARY"])
-        .agg(
-            [
-                pl.col("Revenue_curr").sum().alias("Revenue_curr_sum"),
-                pl.col("Revenue_prev").sum().alias("Revenue_prev_sum"),
-            ]
-        )
-        .to_dicts()
-    )
-    rev_delta_by_sub: Dict[str, float] = {
-        str(row.get("SUBSIDIARY", "")): _to_float(row.get("Revenue_curr_sum")) - _to_float(row.get("Revenue_prev_sum"))
-        for row in perf_rows
-    }
+    sub_metric_rows = df.group_by(["SUBSIDIARY"]).agg(_sum_aggs()).to_dicts()
+    sub_metrics_by_sub: Dict[str, Dict[str, Any]] = {}
+    rev_delta_by_sub: Dict[str, float] = {}
+    for row in sub_metric_rows:
+        sub = str(row.get("SUBSIDIARY", ""))
+        metrics = _metric_pack(row)
+        sub_metrics_by_sub[sub] = metrics
+        rev_delta_by_sub[sub] = _to_float(metrics.get("revenue_delta"))
 
-    key_messages: List[str] = []
+    summary_lines: List[str] = []
     cards: List[str] = []
 
     for sub in subsidiaries:
@@ -685,16 +780,11 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
             block_class = "issue-block"
             block_title = "Issue Top3"
             empty_message = "이슈 토픽 없음"
-            key_prefix = "Issue"
         else:
             selected_topics = improve_topics
             block_class = "improve-block"
-            block_title = "성과재현 Top3"
-            empty_message = "성과재현 토픽 없음"
-            key_prefix = "Replication"
-
-        if selected_topics:
-            key_messages.append(f"{sub} {key_prefix}: {selected_topics[0].get('summary_text', '')}")
+            block_title = "Driver Top3"
+            empty_message = "Driver 토픽 없음"
 
         selected_html = "".join(
             _build_topic_html(row, selected_mode, idx + 1, channel_map, bu_map, product_map)
@@ -703,6 +793,17 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
 
         if not selected_html:
             selected_html = f"<p class=\"muted\">{empty_message}</p>"
+
+        sub_metrics = sub_metrics_by_sub.get(sub, _metric_pack({}))
+        summary_lines.append(
+            _subsidiary_summary_line(
+                sub=sub,
+                mode=selected_mode,
+                metrics=sub_metrics,
+                summary=summary,
+                selected_topics=selected_topics,
+            )
+        )
 
         cards.append(
             "<section class=\"subsidiary-card\">"
@@ -719,7 +820,10 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
     prev_year = comparison_meta.get("prev_year", "")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    message_items = "".join(f"<li>{escape(msg)}</li>" for msg in key_messages) or "<li>핵심 메시지 없음</li>"
+    summary_lines_html = "".join(f"<li class=\"summary-line\">{escape(line)}</li>" for line in summary_lines)
+    if not summary_lines_html:
+        summary_lines_html = "<li class=\"summary-line muted\">요약할 국가 데이터가 없습니다.</li>"
+
     cards_html = "".join(cards) or "<section class=\"subsidiary-card\"><p class=\"muted\">표시할 토픽이 없습니다.</p></section>"
 
     html = f"""<!doctype html>
@@ -843,6 +947,14 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
       margin: 0 0 8px;
       line-height: 1.55;
     }}
+    .summary-list {{
+      margin: 0;
+      padding-left: 18px;
+    }}
+    .summary-line {{
+      margin: 0 0 6px;
+      line-height: 1.6;
+    }}
     .muted {{ color: var(--sub); }}
     @media (max-width: 1080px) {{
       .grid {{
@@ -858,8 +970,10 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
       <div class="meta">기준: OBJECTIVE=CONVERSION | 비교: {escape(str(curr_year))} vs {escape(str(prev_year))} | 생성시각: {escape(generated_at)}</div>
     </section>
     <section class="panel">
-      <h2>Key Messages</h2>
-      <ul>{message_items}</ul>
+      <h2>Global Summary</h2>
+      <ul class="summary-list">
+        {summary_lines_html}
+      </ul>
     </section>
     {cards_html}
   </div>
@@ -868,3 +982,4 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
 """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
+
