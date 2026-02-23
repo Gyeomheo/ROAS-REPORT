@@ -8,7 +8,7 @@ from typing import Any
 
 import polars as pl
 
-from src.reporting import write_html_report
+from src.infrastructure.html_report_legacy import write_html_report
 
 
 def save_summary_json(path: Path, summary: dict[str, Any]) -> None:
