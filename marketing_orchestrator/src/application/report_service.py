@@ -24,7 +24,7 @@ DEFAULT_CURRENT_YEAR = date.today().year
 DEFAULT_PREVIOUS_YEAR = DEFAULT_CURRENT_YEAR - 1
 CHANNEL_DIMS: List[str] = ["SUBSIDIARY", "CHANNEL"]
 DIVISION_DIMS: List[str] = ["SUBSIDIARY", "CHANNEL", "DIVISION"]
-MIN_TOPIC_IMPACT_PCT = 0.03
+MIN_TOPIC_ROAS_ABS_DELTA = 0.03
 ScopeMaps = tuple[
     Dict[tuple[Any, ...], Dict[str, Any]],
     Dict[tuple[Any, ...], Dict[str, Any]],
@@ -245,31 +245,51 @@ def _insight_text(
     division_aov_curr = _safe_ratio(division_rev_curr, division_orders_curr)
     division_aov_prev = _safe_ratio(division_rev_prev, division_orders_prev)
     division_rev_share = _safe_ratio(division_rev_curr, channel_rev_curr)
-    channel_delta = channel_rev_curr - channel_rev_prev
-    channel_abs_delta = abs(channel_delta)
+    channel_roas_delta = (
+        0.0
+        if channel_roas_curr is None or channel_roas_prev is None
+        else _to_float(channel_roas_curr) - _to_float(channel_roas_prev)
+    )
+    channel_abs_delta = abs(channel_roas_delta)
     impact_adj = _to_float(row.get("Impact_adj"))
     division_name = str(row.get("DIVISION", "DIVISION"))
     subsidiary_name = str(row.get("SUBSIDIARY", ""))
     subsidiary_row = subsidiary_map.get(subsidiary_name, {})
-    subsidiary_delta = _to_float(subsidiary_row.get("Revenue_curr_sum")) - _to_float(subsidiary_row.get("Revenue_prev_sum"))
-    division_delta = division_rev_curr - division_rev_prev
+    subsidiary_roas_curr = _safe_ratio(
+        _to_float(subsidiary_row.get("Revenue_curr_sum")),
+        _to_float(subsidiary_row.get("Spend_curr_sum")),
+    )
+    subsidiary_roas_prev = _safe_ratio(
+        _to_float(subsidiary_row.get("Revenue_prev_sum")),
+        _to_float(subsidiary_row.get("Spend_prev_sum")),
+    )
+    subsidiary_delta = (
+        0.0
+        if subsidiary_roas_curr is None or subsidiary_roas_prev is None
+        else _to_float(subsidiary_roas_curr) - _to_float(subsidiary_roas_prev)
+    )
+    division_delta = (
+        0.0
+        if division_roas_curr is None or division_roas_prev is None
+        else _to_float(division_roas_curr) - _to_float(division_roas_prev)
+    )
 
     if impact_contribution_pct is None and channel_abs_delta > 0:
-        impact_contribution_pct = _direct_contribution_pct(impact_adj, channel_delta, mode_tag)
+        impact_contribution_pct = _direct_contribution_pct(impact_adj, channel_roas_delta, mode_tag)
 
     if mode_tag == "ISSUE":
-        contribution_rate_label = "상위 하락 기여율"
+        contribution_rate_label = "상위 ROAS 하락 기여율"
     elif mode_tag in {"IMPROVE", "DEFENSE"}:
-        contribution_rate_label = "상위 개선 기여율"
+        contribution_rate_label = "상위 ROAS 개선 기여율"
     else:
-        contribution_rate_label = "상위 기여율"
+        contribution_rate_label = "상위 ROAS 기여율"
 
     channel_event = _trace_event_by_dim(row.get("drill_trace"), "CHANNEL")
     division_event = _trace_event_by_dim(row.get("drill_trace"), "DIVISION")
     channel_impact = _to_float(channel_event.get("impact_adj"))
     division_impact = _to_float(division_event.get("impact_adj"))
     channel_direct_pct = _direct_contribution_pct(channel_impact, subsidiary_delta, mode_tag)
-    division_direct_pct = _direct_contribution_pct(division_impact, channel_delta, mode_tag)
+    division_direct_pct = _direct_contribution_pct(division_impact, channel_roas_delta, mode_tag)
     product_direct_pct = _direct_contribution_pct(impact_adj, division_delta, mode_tag)
     if product_direct_pct is None:
         product_direct_pct = impact_contribution_pct
@@ -423,12 +443,27 @@ def _to_report_rows(
         group_map.setdefault(gkey, []).append(item)
 
     rank_map: Dict[tuple[Any, Any, Any, Any, Any], Dict[str, int]] = {}
+
+    def _row_roas_delta(item: Dict[str, Any]) -> float:
+        roas_curr = item.get("ROAS_curr")
+        roas_prev = item.get("ROAS_prev")
+        if roas_curr is None or roas_prev is None:
+            rev_curr = _to_float(item.get("Revenue_curr_sum"))
+            rev_prev = _to_float(item.get("Revenue_prev_sum"))
+            spend_curr = _to_float(item.get("Spend_curr_sum"))
+            spend_prev = _to_float(item.get("Spend_prev_sum"))
+            roas_curr = _safe_ratio(rev_curr, spend_curr)
+            roas_prev = _safe_ratio(rev_prev, spend_prev)
+        if roas_curr is None or roas_prev is None:
+            return 0.0
+        return _to_float(roas_curr) - _to_float(roas_prev)
+
     for gkey, items in group_map.items():
         mode = gkey[3]
         if mode == "ISSUE":
-            ordered = sorted(items, key=lambda r: (_to_float(r.get("Impact_adj")), str(r.get("PRODUCT", ""))))
+            ordered = sorted(items, key=lambda r: (_row_roas_delta(r), str(r.get("PRODUCT", ""))))
         else:
-            ordered = sorted(items, key=lambda r: (-_to_float(r.get("Impact_adj")), str(r.get("PRODUCT", ""))))
+            ordered = sorted(items, key=lambda r: (-_row_roas_delta(r), str(r.get("PRODUCT", ""))))
         pool_size = len(ordered)
         for idx, it in enumerate(ordered, start=1):
             rkey = (
@@ -447,11 +482,54 @@ def _to_report_rows(
         division_key = tuple(row.get(dim) for dim in DIVISION_DIMS)
         channel_row = channel_map.get(channel_key, {})
         division_row = division_map.get(division_key, {})
-        channel_delta = _to_float(channel_row.get("Revenue_curr_sum")) - _to_float(channel_row.get("Revenue_prev_sum"))
-        division_delta = _to_float(division_row.get("Revenue_curr_sum")) - _to_float(division_row.get("Revenue_prev_sum"))
         impact_adj = _to_float(row.get("Impact_adj"))
         mode_tag = str(row.get("mode_tag", "")).upper()
-        impact_contribution_pct = _direct_contribution_pct(impact_adj, division_delta, mode_tag)
+        topic_roas_curr = row.get("ROAS_curr")
+        topic_roas_prev = row.get("ROAS_prev")
+        if topic_roas_curr is None:
+            topic_roas_curr = _safe_ratio(_to_float(row.get("Revenue_curr_sum")), _to_float(row.get("Spend_curr_sum")))
+        if topic_roas_prev is None:
+            topic_roas_prev = _safe_ratio(_to_float(row.get("Revenue_prev_sum")), _to_float(row.get("Spend_prev_sum")))
+        topic_roas_delta = (
+            None
+            if topic_roas_curr is None or topic_roas_prev is None
+            else _to_float(topic_roas_curr) - _to_float(topic_roas_prev)
+        )
+
+        division_roas_curr = _safe_ratio(
+            _to_float(division_row.get("Revenue_curr_sum")),
+            _to_float(division_row.get("Spend_curr_sum")),
+        )
+        division_roas_prev = _safe_ratio(
+            _to_float(division_row.get("Revenue_prev_sum")),
+            _to_float(division_row.get("Spend_prev_sum")),
+        )
+        division_roas_delta = (
+            None
+            if division_roas_curr is None or division_roas_prev is None
+            else _to_float(division_roas_curr) - _to_float(division_roas_prev)
+        )
+
+        impact_contribution_pct: float | None = None
+        if (
+            topic_roas_delta is not None
+            and division_roas_delta is not None
+            and abs(division_roas_delta) > 0
+        ):
+            denominator = abs(division_roas_delta)
+            if mode_tag == "ISSUE":
+                impact_contribution_pct = max(0.0, -topic_roas_delta) / denominator
+            elif mode_tag in {"IMPROVE", "DEFENSE"}:
+                impact_contribution_pct = max(0.0, topic_roas_delta) / denominator
+            else:
+                impact_contribution_pct = abs(topic_roas_delta) / denominator
+        else:
+            division_delta = (
+                0.0
+                if division_roas_delta is None
+                else division_roas_delta
+            )
+            impact_contribution_pct = _direct_contribution_pct(impact_adj, division_delta, mode_tag)
         summary_text, detail_text = _insight_text(
             row,
             channel_map=channel_map,
@@ -471,21 +549,21 @@ def _to_report_rows(
             {"rank": 1, "pool_size": 1},
         )
         if mode_tag == "ISSUE":
-            contribution_type = "하락 기여"
+            contribution_direction_kr = "하락"
         else:
-            contribution_type = "개선 기여"
+            contribution_direction_kr = "개선"
 
         caution = ""
         tag = str(row.get("tag", "") or "")
         if tag == "NEW":
-            caution = " 신규(tag=NEW)로 연속 기간 성과를 추가 확인하세요."
+            caution = " 신규 토픽(NEW): 기간 확장 후 추세 재확인 권장."
         elif tag == "LOW_VOL":
-            caution = " 저볼륨(tag=LOW_VOL)이라 변동성 해석에 주의가 필요합니다."
+            caution = " 저볼륨(LOW_VOL): 변동성 주의 해석 필요."
 
         why_selected_text = (
-            f"{row.get('CHANNEL')}/{row.get('DIVISION')} 내 {rank_info['pool_size']}개 상품 중 "
-            f"{rank_info['rank']}위, {contribution_type} {_fmt_pct(impact_contribution_pct, signed=False)} "
-            f"기여율로 선정.{caution}"
+            f"{row.get('CHANNEL')}/{row.get('DIVISION')} ROAS {contribution_direction_kr}에 영향 "
+            f"{rank_info['rank']}위, {_fmt_pct(impact_contribution_pct, signed=False)}, "
+            f"주요 지표는 {row.get('primary_driver', 'NONE')}.{caution}"
         )
         report_rows.append(
             {
@@ -518,6 +596,9 @@ def _to_report_rows(
                 "CPC_prev": row.get("CPC_prev"),
                 "AOV_curr": row.get("AOV_curr"),
                 "AOV_prev": row.get("AOV_prev"),
+                "topic_roas_curr": topic_roas_curr,
+                "topic_roas_prev": topic_roas_prev,
+                "topic_roas_delta": topic_roas_delta,
             }
         )
     return report_rows
@@ -527,7 +608,7 @@ def _top3_by_subsidiary(rows: List[Dict[str, Any]], descending: bool) -> Dict[st
     return reporting_selectors.top3_by_subsidiary(
         rows,
         descending=descending,
-        min_topic_impact_pct=MIN_TOPIC_IMPACT_PCT,
+        min_topic_roas_abs_delta=MIN_TOPIC_ROAS_ABS_DELTA,
     )
 
 
@@ -569,6 +650,7 @@ def _subsidiary_metrics(scope_row: Dict[str, Any]) -> Dict[str, Any]:
         "cvr_yoy": _safe_pct_change(cvr_curr, cvr_prev),
         "roas_curr": roas_curr,
         "roas_prev": roas_prev,
+        "roas_delta": None if roas_curr is None or roas_prev is None else roas_curr - roas_prev,
         "roas_yoy": _safe_pct_change(roas_curr, roas_prev),
     }
 
@@ -682,7 +764,7 @@ def _campaign_pretty_sheet_df(rows: List[Dict[str, Any]], curr_year: int, prev_y
         "product",
         "mode",
         "driver",
-        "impact_revenue",
+        "impact_roas",
         revenue_curr_col,
         revenue_prev_col,
         "revenue_yoy",
@@ -721,7 +803,11 @@ def _campaign_pretty_sheet_df(rows: List[Dict[str, Any]], curr_year: int, prev_y
                 "product": row.get("PRODUCT"),
                 "mode": row.get("mode_tag"),
                 "driver": row.get("primary_driver"),
-                "impact_revenue": _fmt_money_signed(row.get("Impact_adj")),
+                "impact_roas": (
+                    "N/A"
+                    if row.get("Impact_adj") is None
+                    else f"{_to_float(row.get('Impact_adj')):+.3f}"
+                ),
                 revenue_curr_col: _fmt_money(rev_curr),
                 revenue_prev_col: _fmt_money(rev_prev),
                 "revenue_yoy": _fmt_pct(_safe_pct_change(rev_curr, rev_prev)),
@@ -754,13 +840,14 @@ def _division_sheet_df(divisions: List[Dict[str, Any]]) -> pl.DataFrame:
         "Spend_yoy_pct",
         "ROAS_curr",
         "ROAS_prev",
+        "ROAS_delta",
         "ROAS_yoy_pct",
         "Impact_raw",
         "Impact_adj",
         "Impact_raw_method",
         "Residual_parent",
         "Residual_applied_flag",
-        "Parent_revenue_delta",
+        "Parent_roas_delta",
         "Contribution_to_total_delta_pct",
         "Contribution_to_decline_pct",
         "Contribution_to_growth_pct",
@@ -883,7 +970,7 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
         "decomposition_method": {
             "impact_raw": "LMDI(log-mean) with direct delta fallback when log condition is invalid",
             "impact_adj": "Impact_raw + residual correction proportionally allocated by |Impact_raw|",
-            "division_contribution_pct": "Contribution_to_decline_pct/growth_pct is based on Impact_adj vs parent revenue delta",
+            "division_contribution_pct": "Contribution_to_decline_pct/growth_pct is based on Impact_adj vs parent ROAS delta",
         },
         "division_parallel_contribution": division_parallel,
         "subsidiary_reports": subsidiary_reports,

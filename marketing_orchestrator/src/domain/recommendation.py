@@ -58,7 +58,7 @@ def recommended_action(signals: CampaignSignals) -> str:
     if tag == "GONE":
         return "집행 중단 상태: 대체 캠페인 커버리지와 리마케팅 공백을 광고 운영 범위에서 점검."
     if tag == "UNDEFINED":
-        return "지표 결측/0값: 태깅, 어트리뷰션, 집계 로직을 광고 데이터 관점에서 점검."
+        return "지표 결측/0값: 전환 액션 매핑, 캠페인 목표, 입찰전략 설정을 광고 플랫폼 기준으로 점검."
 
     if mode_tag == "ISSUE":
         if driver == "CPC":
@@ -69,17 +69,17 @@ def recommended_action(signals: CampaignSignals) -> str:
             return "CPC 이슈: High-intent 키워드/오디언스 비중 확대 + 비효율 검색어/지면 제외로 유입 효율 복원."
         if driver == "CVR":
             if channel_type == "SEARCH":
-                return "Search CVR 이슈: 고의도 쿼리 중심으로 구조를 재편하고 광고 카피-랜딩 메시지 정합성을 강화해 전환율을 복원."
+                return "Search CVR 이슈: 고의도 쿼리 중심으로 구조를 재편하고 전환형 카피/애셋 비중을 높여 전환율을 복원."
             if channel_type == "PMAX":
                 return "Pmax CVR 이슈: 고CVR SKU 중심 Asset Group 재구성과 오디언스 시그널/신규고객 목표 정교화로 전환 질을 개선."
-            return "CVR 이슈: 유입 의도(키워드/오디언스)와 랜딩 메시지 정합성을 맞춰 전환 효율 복원."
+            return "CVR 이슈: 유입 의도(키워드/오디언스) 정합성과 전환형 소재 운영으로 전환 효율 복원."
         if driver == "AOV":
             if channel_type == "SEARCH":
                 return "Search AOV 이슈: 고가 SKU 쿼리 분리 운영과 tROAS 상향으로 고가 전환 비중을 확대하고 저객단가 유입은 축소."
             if channel_type == "PMAX":
                 return "Pmax AOV 이슈: 고AOV SKU 전용 피드 라벨·Asset Group 분리와 value rule/tROAS 조정으로 고가 매출 중심 최적화."
-            return "AOV 이슈: tROAS 상향/세분화 + 고가 SKU(예: S25 Ultra, 1TB) 유입 비중 확대."
-        return "핵심 퍼널 지표 재점검 후 타게팅/입찰 규칙을 광고 운영 범위에서 재설정."
+            return "AOV 이슈: tROAS 상향/세분화 + 고가 SKU 유입 비중 확대."
+        return "핵심 캠페인 지표 재점검 후 타게팅/입찰 규칙을 광고 운영 범위에서 재설정."
 
     if mode_tag in {"IMPROVE", "DEFENSE"}:
         if driver == "CPC":
@@ -90,10 +90,10 @@ def recommended_action(signals: CampaignSignals) -> str:
             return "CPC 개선 재현: 저CPC·고CTR 세그먼트 중심으로 점진 증액하며 효율 유지."
         if driver == "CVR":
             if channel_type == "SEARCH":
-                return "Search CVR 개선 재현: 고CVR 쿼리 클러스터를 증액하고 승자 카피·랜딩 조합을 동일 의도군으로 복제 확장."
+                return "Search CVR 개선 재현: 고CVR 쿼리 클러스터를 증액하고 승자 카피·소재 조합을 동일 의도군으로 복제 확장."
             if channel_type == "PMAX":
                 return "Pmax CVR 개선 재현: 고CVR Asset Group 증액과 오디언스 시그널/신규고객 목표 유지로 전환 효율을 재현."
-            return "CVR 개선 재현: 고CVR 키워드/오디언스와 랜딩 조합을 복제 확장."
+            return "CVR 개선 재현: 고CVR 키워드/오디언스와 승자 소재 조합을 복제 확장."
         if driver == "AOV":
             if channel_type == "SEARCH":
                 return "Search AOV 개선 재현: 고가 SKU 키워드/오디언스 비중을 확대하고 가치기반 입찰로 고단가 전환 점유율을 유지."
@@ -116,11 +116,11 @@ def action_checklist(signals: CampaignSignals) -> str:
     if tag == "LOW_VOL":
         return "1) 클릭/주문 최소 표본 확보; 2) High-intent 키워드/오디언스 우선 집행; 3) 성급한 입찰/구조 변경 제한"
     if tag == "NEW":
-        return "1) tROAS 또는 가치기반 입찰 세팅; 2) 브랜드+모델+용량(예: S25 Ultra, 1TB) 키워드 우선; 3) 예산 증액 10-20% 단계 적용"
+        return "1) tROAS 또는 가치기반 입찰 세팅; 2) 브랜드+모델+용량 키워드 우선; 3) 예산 증액 10-20% 단계 적용"
     if tag == "GONE":
         return "1) 중단 의도 확인; 2) 대체 캠페인 커버리지 확인; 3) 리마케팅 공백 점검"
     if tag == "UNDEFINED":
-        return "1) 클릭/주문/매출 0값 점검; 2) 태깅/어트리뷰션 상태 확인; 3) 집계 기간 정합성 확인"
+        return "1) 전환 액션 매핑/중복 여부 점검; 2) 캠페인 목표-입찰전략 일치 확인; 3) 플랫폼 내 리포트 기간/기여모델 정합성 확인"
 
     if driver == "CPC":
         if mode_tag == "ISSUE":
@@ -137,22 +137,22 @@ def action_checklist(signals: CampaignSignals) -> str:
     if driver == "CVR":
         if mode_tag == "ISSUE":
             if channel_type == "SEARCH":
-                return "1) 브랜드+모델+용량 등 고의도 쿼리 비중 확대, 저의도 쿼리 제외; 2) 쿼리 의도별 RSA 메시지와 랜딩 매핑 정합성 강화; 3) tCPA/tROAS 목표를 단계 조정해 학습 안정화 후 재상향"
+                return "1) 브랜드+모델+용량 등 고의도 쿼리 비중 확대, 저의도 쿼리 제외; 2) 쿼리 의도별 RSA 메시지 정합성 강화 및 전환형 카피 비중 확대; 3) tCPA/tROAS 목표를 단계 조정해 학습 안정화 후 재상향"
             if channel_type == "PMAX":
-                return "1) 고CVR SKU 기준 Asset Group 재구성; 2) 리마케팅/고LTV 중심 오디언스 시그널 및 신규고객 목표 재정의; 3) 전환가치·전환이벤트 집계 우선순위 점검"
-            return "1) 키워드/오디언스 의도와 랜딩 메시지 일치 점검; 2) CVR 낮은 검색어·오디언스는 제외/입찰 하향하고 고CVR 세그먼트로 예산 재배분; 3) 전환 가능성 낮은 유입 지면·매체 비중 축소"
+                return "1) 고CVR SKU 기준 Asset Group 재구성; 2) 리마케팅/고LTV 중심 오디언스 시그널 및 신규고객 목표 재정의; 3) 전환 액션 선택/가치설정 우선순위 점검"
+            return "1) 키워드/오디언스 의도 정합성 점검; 2) CVR 낮은 검색어·오디언스 제외/입찰 하향 후 고CVR 세그먼트로 예산 재배분; 3) 전환 저조 지면·매체 비중 축소"
         if channel_type == "SEARCH":
-            return "1) 고CVR 쿼리/오디언스 10-20% 증액; 2) 승자 카피·랜딩 조합 복제 및 테스트 슬롯 분리; 3) 스케일 구간 CVR 하락 가드레일 운영"
+            return "1) 고CVR 쿼리/오디언스 10-20% 증액; 2) 승자 카피·소재 조합 복제 및 테스트 슬롯 분리; 3) 스케일 구간 CVR 하락 가드레일 운영"
         if channel_type == "PMAX":
             return "1) 고CVR Asset Group 우선 증액; 2) 신규고객 가치 규칙/오디언스 시그널 유지; 3) 소재 교체는 단계 적용해 학습 리셋 최소화"
-        return "1) 고CVR 키워드/오디언스 확장; 2) 승자 랜딩/소재 조합 복제; 3) 스케일 시 CVR 하락 가드레일 설정"
+        return "1) 고CVR 키워드/오디언스 확장; 2) 승자 소재 조합 복제; 3) 스케일 시 CVR 하락 가드레일 설정"
     if driver == "AOV":
         if mode_tag == "ISSUE":
             if channel_type == "SEARCH":
                 return "1) 고가 SKU 키워드군 분리 및 tROAS 목표 상향; 2) 저객단가 쿼리 매치타입 제한/입찰 하향; 3) 고가 모델 중심 카피/오디언스로 예산 재배분"
             if channel_type == "PMAX":
                 return "1) 고AOV SKU 피드 라벨/Asset Group 분리; 2) value rule로 고가 전환 가치 가중; 3) 저AOV SKU 비중 축소 및 예산 재배분"
-            return "1) tROAS 목표 상향/세분화; 2) 고가 SKU 키워드/오디언스(예: S25 Ultra, 1TB) 비중 확대; 3) 저객단가 쿼리/지면 제외 및 입찰 하향"
+            return "1) tROAS 목표 상향/세분화; 2) 고가 SKU 키워드/오디언스 비중 확대; 3) 저객단가 쿼리/지면 제외 및 입찰 하향"
         if channel_type == "SEARCH":
             return "1) 고AOV 키워드/오디언스 단계 증액; 2) 고가 SKU 애드그룹 점유율 유지; 3) AOV/ROAS 하락 가드레일로 스케일 관리"
         if channel_type == "PMAX":

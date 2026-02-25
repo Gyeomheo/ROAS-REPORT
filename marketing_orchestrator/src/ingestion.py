@@ -56,6 +56,65 @@ PREFERRED_COLUMN_SETS: list[list[str]] = [
     LONG_COLUMNS_YEAR_ALT_MIN,
     ENGINE_COLUMNS,
 ]
+SOURCE_RAW_HEADERS: tuple[str, ...] = (
+    "Year",
+    "Month",
+    "Day",
+    "PLATFORM",
+    "SUBSIDIARY",
+    "REGION",
+    "COUNTRY",
+    "DIVISION",
+    "CAMPAIGN_NAME",
+    "CAMPAIGN_ID",
+    "PLATFORM_CAMPAIGN_TYPE",
+    "CHANNEL",
+    "PRODUCT",
+    "SOCIAL_CONTENT_TYPE",
+    "BID_STRATEGY_TYPE",
+    "CAMPAIGN_OBJECTIVE",
+    "OBJECTIVE",
+    "TAXO_PHASE_PH",
+    "PUBLISHER",
+    "PLATFORM_LANDING_PAGE_URL",
+    "TARGET_TYPE",
+    "AI_AD_PRODUCT",
+    "MX_FLAGSHIP",
+    "MX_FLAGSHIP_S",
+    "MX_FLAGSHIP_S_DETAIL",
+    "MX_FLAGSHIP_Z",
+    "MX_FLAGSHIP_Z_DETAIL",
+    "GOOGLE_ADS_NETWORK",
+    "GOOGLE_ADS_EXTERNAL_CONVERSION_SOURCE",
+    "ACCOUNT",
+    "ACCOUNT_ID",
+    "PLATFORM_SPEND_USD",
+    "PLATFORM_IMPRESSIONS",
+    "PLATFORM_CLICKS",
+    "VISITS",
+    "QUALIFY_VISITS",
+    "GROSS_ORDERS",
+    "GROSS_REVENUE",
+    "PLATFORM_TOTAL_CONVERSIONS",
+    "PLATFORM_REVENUE_USD",
+    "META_MOBILE_APP_PURCHASE",
+    "META_WEB_PURCHASE",
+    "PLATFORM_VIDEO_VIEWS",
+)
+SOURCE_HEADER_MAP: dict[str, str] = {header.upper(): header for header in SOURCE_RAW_HEADERS}
+SOURCE_HEADER_SCAN_MAX_ROWS = 120
+REQUIRED_LONG_HEADERS_UPPER: set[str] = {
+    "YEAR",
+    "SUBSIDIARY",
+    "CHANNEL",
+    "DIVISION",
+    "PRODUCT",
+    "PLATFORM_SPEND_USD",
+    "PLATFORM_CLICKS",
+    "GROSS_ORDERS",
+    "GROSS_REVENUE",
+}
+REQUIRED_WIDE_HEADERS_UPPER: set[str] = {column.upper() for column in ENGINE_COLUMNS}
 DEFAULT_CURR_YEAR = date.today().year
 DEFAULT_PREV_YEAR = DEFAULT_CURR_YEAR - 1
 
@@ -92,6 +151,36 @@ def _normalize_headers(raw_headers: Sequence[Any]) -> list[str]:
         seen[base] = count + 1
         headers.append(name)
     return headers
+
+
+def _canonical_header_name(name: str) -> str:
+    cleaned = str(name).strip()
+    if cleaned == "":
+        return cleaned
+    return SOURCE_HEADER_MAP.get(cleaned.upper(), cleaned)
+
+
+def _standardize_known_columns(df: pl.DataFrame) -> pl.DataFrame:
+    if df.is_empty() and not df.columns:
+        return df
+    rename_map: dict[str, str] = {}
+    future_cols = set(df.columns)
+    for col in df.columns:
+        canonical = _canonical_header_name(col)
+        if canonical == col:
+            continue
+        if canonical in future_cols:
+            continue
+        rename_map[col] = canonical
+        future_cols.add(canonical)
+    if not rename_map:
+        return df
+    return df.rename(rename_map)
+
+
+def _looks_like_supported_input(columns: Sequence[str]) -> bool:
+    upper = {str(column).strip().upper() for column in columns}
+    return REQUIRED_WIDE_HEADERS_UPPER.issubset(upper) or REQUIRED_LONG_HEADERS_UPPER.issubset(upper)
 
 
 def _select_sheet_name(path: Path, preferred_sheet: str) -> str:
@@ -141,41 +230,97 @@ def _read_with_polars(path: Path, preferred_sheet: str, target_sheet: str) -> pl
 
         try:
             frame = _read_excel_polars(path, sheet_name=sheet_name)
-            return _frame_from_polars_result(frame, preferred_sheet)
+            normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
+            if _looks_like_supported_input(normalized.columns):
+                return normalized
         except Exception:
             pass
 
         for columns in PREFERRED_COLUMN_SETS:
             try:
                 frame = _read_excel_polars(path, sheet_name=sheet_name, columns=columns)
-                return _frame_from_polars_result(frame, preferred_sheet)
+                normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
+                if _looks_like_supported_input(normalized.columns):
+                    return normalized
             except Exception:
                 continue
 
     try:
         frame = _read_excel_polars(path, sheet_name=preferred_sheet)
-        return _frame_from_polars_result(frame, preferred_sheet)
+        normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
+        if _looks_like_supported_input(normalized.columns):
+            return normalized
     except Exception:
-        frame = _read_excel_polars(path)
-        return _frame_from_polars_result(frame, preferred_sheet)
+        pass
+
+    frame = _read_excel_polars(path)
+    normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
+    return normalized
 
 
 def _read_with_openpyxl(path: Path, target_sheet: str, preferred_sheet: str) -> pl.DataFrame:
     _, load_workbook = _import_openpyxl()
     workbook = load_workbook(path, read_only=True, data_only=True)
 
-    sheet_name = target_sheet
-    if sheet_name not in workbook.sheetnames:
-        sheet_name = preferred_sheet if preferred_sheet in workbook.sheetnames else workbook.sheetnames[0]
+    candidate_sheets: list[str] = []
+    for name in [target_sheet, preferred_sheet, *list(workbook.sheetnames)]:
+        if name and name in workbook.sheetnames and name not in candidate_sheets:
+            candidate_sheets.append(name)
 
-    worksheet = workbook[sheet_name]
+    def _try_sheet(sheet_name: str) -> pl.DataFrame | None:
+        worksheet = workbook[sheet_name]
+        header_row_idx: int | None = None
+        headers: list[str] = []
+        for idx, row_values in enumerate(
+            worksheet.iter_rows(values_only=True, max_row=SOURCE_HEADER_SCAN_MAX_ROWS), start=1
+        ):
+            if row_values is None:
+                continue
+            normalized_headers = [_canonical_header_name(h) for h in _normalize_headers(row_values)]
+            if _looks_like_supported_input(normalized_headers):
+                header_row_idx = idx
+                headers = normalized_headers
+                break
+        if header_row_idx is None:
+            return None
+
+        records: list[dict[str, Any]] = []
+        for values in worksheet.iter_rows(values_only=True, min_row=header_row_idx + 1):
+            if values is None or all(value is None for value in values):
+                continue
+            row_data: dict[str, Any] = {}
+            for col_idx, name in enumerate(headers):
+                row_data[name] = values[col_idx] if col_idx < len(values) else None
+            records.append(row_data)
+
+        if not records:
+            return pl.DataFrame({name: [] for name in headers})
+        return pl.DataFrame(records)
+
+    selected_df: pl.DataFrame | None = None
+    for sheet_name in candidate_sheets:
+        frame = _try_sheet(sheet_name)
+        if frame is None:
+            continue
+        selected_df = _standardize_known_columns(frame)
+        break
+
+    workbook.close()
+    if selected_df is not None:
+        return selected_df
+
+    # Legacy fallback: first row as header from target/first sheet.
+    fallback_sheet = target_sheet if target_sheet in workbook.sheetnames else (
+        preferred_sheet if preferred_sheet in workbook.sheetnames else workbook.sheetnames[0]
+    )
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    worksheet = workbook[fallback_sheet]
     row_iter = worksheet.iter_rows(values_only=True)
     header_row = next(row_iter, None)
     if header_row is None:
         workbook.close()
         return pl.DataFrame()
-
-    headers = _normalize_headers(header_row)
+    headers = [_canonical_header_name(h) for h in _normalize_headers(header_row)]
     records: list[dict[str, Any]] = []
     for values in row_iter:
         if values is None or all(value is None for value in values):
@@ -184,11 +329,10 @@ def _read_with_openpyxl(path: Path, target_sheet: str, preferred_sheet: str) -> 
         for idx, name in enumerate(headers):
             row_data[name] = values[idx] if idx < len(values) else None
         records.append(row_data)
-
     workbook.close()
     if not records:
         return pl.DataFrame({name: [] for name in headers})
-    return pl.DataFrame(records)
+    return _standardize_known_columns(pl.DataFrame(records))
 
 
 def _year_expr(column_name: str) -> pl.Expr:
@@ -419,40 +563,32 @@ def _apply_mtd_alignment(
         return scoped, meta
 
     max_month = curr_scope.select(pl.col("Month").max()).to_series(0)[0]
-    min_month = curr_scope.select(pl.col("Month").min()).to_series(0)[0]
     if max_month is None:
         return scoped, meta
 
-    if min_month is not None:
-        meta["mtd_month_start"] = int(min_month)
+    meta["mtd_month_start"] = int(max_month)
     meta["mtd_month_cutoff"] = int(max_month)
 
     has_day = "Day" in scoped.columns
     max_day = None
-    min_day = None
     if has_day:
-        if min_month is not None:
-            min_day = (
-                curr_scope.filter(pl.col("Month") == pl.lit(min_month))
-                .select(pl.col("Day").min())
-                .to_series(0)[0]
-            )
         max_day = (
             curr_scope.filter(pl.col("Month") == pl.lit(max_month))
             .select(pl.col("Day").max())
             .to_series(0)[0]
         )
-        if min_day is not None:
-            meta["mtd_day_start"] = int(min_day)
         if max_day is not None:
+            meta["mtd_day_start"] = 1
             meta["mtd_day_cutoff"] = int(max_day)
 
     if has_day and max_day is not None:
-        in_window = (pl.col("Month") < pl.lit(max_month)) | (
-            (pl.col("Month") == pl.lit(max_month)) & (pl.col("Day") <= pl.lit(max_day))
+        in_window = (
+            (pl.col("Month") == pl.lit(max_month))
+            & (pl.col("Day") >= pl.lit(1))
+            & (pl.col("Day") <= pl.lit(max_day))
         )
     else:
-        in_window = pl.col("Month") <= pl.lit(max_month)
+        in_window = pl.col("Month") == pl.lit(max_month)
 
     meta["mtd_applied"] = True
     return scoped.filter(in_window), meta

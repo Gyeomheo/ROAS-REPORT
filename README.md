@@ -25,8 +25,8 @@ main.py (CLI Entrypoint)
           -> ingestion.read_input_excel (Polars-first, openpyxl fallback, DQ check)
           -> output/.cache parquet/meta (입력 캐시)
       -> application.analysis_service.run_subsidiary_analysis
-          -> ImpactEngine (LMDI + residual 보정 + drill-down)
-          -> RootCauseEngine (dlog 기반 driver 추정)
+          -> ImpactEngine (LMDI 기반 매출 기여 분해 + residual 잔차 보정 + drill-down)
+          -> RootCauseEngine (dlog(=delta-log) 기반 driver 추정)
           -> campaign_action_service (도메인 액션 문구/체크리스트)
       -> application.reporting.*
           -> metrics (공통 수치/포맷)
@@ -61,7 +61,104 @@ main.py (CLI Entrypoint)
 - 입력 전처리 결과를 `output/.cache`에 캐시하여 재실행 시간을 단축합니다.
 - Excel I/O는 Polars 우선, 실패 시 openpyxl fallback으로 안정성을 확보합니다.
 
-## 3) 현재 디렉터리 구조
+## 3) 주요 알고리즘 요약 (마케터 버전)
+
+### 먼저 한 줄로
+- `ImpactEngine`: 무엇이 매출 증감에 얼마나 영향을 줬는지 찾는 단계
+- `RootCauseEngine`: 그 변화가 `CPC/CVR/AOV` 중 무엇 때문인지 찾는 단계
+
+### ImpactEngine (`src/impact.py`)
+- 분석 순서: `SUBSIDIARY -> CHANNEL -> DIVISION -> PRODUCT`
+
+`LMDI` 상세:
+
+1. 기본 아이디어  
+   부모 매출 변화액(`Parent_revenue_delta`)을 자식 항목(예: division, product)별 기여도로 분해합니다.
+
+2. 로그평균(Log-Mean)  
+   `L(x, y) = (x - y) / (ln x - ln y)`  
+   단, `x == y`면 `L(x, y) = x`로 처리합니다.
+
+3. 1차 기여도 `Impact_raw` 계산  
+   LMDI 유효 조건(부모/자식 현재·전년 매출 모두 양수 + 로그 계산 가능)을 만족하면:
+
+   ```text
+   Impact_raw_i
+   = ( L(Revenue_curr_i, Revenue_prev_i) / L(Parent_curr, Parent_prev) )
+     * ln(Parent_curr / Parent_prev)
+     * (Parent_curr - Parent_prev)
+   ```
+
+   유효 조건을 만족하지 못하면 안전하게 direct delta fallback:
+
+   ```text
+   Impact_raw_i = Revenue_curr_i - Revenue_prev_i
+   ```
+
+4. residual(잔차) 보정  
+   - `Residual_parent = Parent_delta - Σ Impact_raw_i`
+   - 잔차는 한 항목 몰아주기 대신 `|Impact_raw|` 비례 배분:
+
+   ```text
+   residual_alloc_i = (|Impact_raw_i| / Σ|Impact_raw|) * Residual_parent
+   Impact_adj_i = Impact_raw_i + residual_alloc_i
+   ```
+
+   - `Σ|Impact_raw| == 0`이면 자식 수로 균등 배분합니다.
+
+5. 해석용 비율  
+   - `Share_childsum = |Impact_adj_i| / Σ|Impact_adj|`
+   - `Share_parentdelta = |Impact_adj_i| / |Parent_delta|`
+
+6. drill-down 규칙  
+   - `SINGLE`: `top1_share >= 0.45` AND `(top1_share - top2_share) >= 0.15` AND `|top1_impact| >= impact_floor`
+   - 그 외:
+     - 부모 변화가 음수면 `WIDE_NEG` (음수 기여 상위 최대 3개)
+     - 부모 변화가 양수면 `WIDE_POS` (양수 기여 상위 최대 3개)
+     - 부모 변화가 0이면 `STOP_ZERO_DELTA`
+   - `impact_floor = max(abs_floor_amount, parent_prev_revenue * rel_floor)`
+
+### RootCauseEngine (`src/root_cause.py`)
+- 기본 관계: `ROAS = CVR × AOV ÷ CPC`
+- 왜 이렇게 되나요? (정의에서 바로 나옵니다)
+```text
+ROAS = Revenue / Spend
+CVR = Orders / Clicks, AOV = Revenue / Orders, CPC = Spend / Clicks
+CVR × AOV ÷ CPC
+= (Orders/Clicks) × (Revenue/Orders) × (Clicks/Spend)
+= Revenue / Spend   (Orders, Clicks가 약분)
+```
+- `dlog`는 전년 대비 변화를 "방향(+/-)과 강도"로 비교하기 위한 점수입니다.
+해석 기준(간단):
+- `dlog_CVR`가 크고 +면 CVR 개선 영향이 큼
+- `dlog_AOV`가 크고 +면 객단가 개선 영향이 큼
+- `dlog_CPC`가 크고 +면 CPC 악화(비용 상승) 영향이 큼
+- `primary_driver`는 위 3개 중 실제 결과(악화/개선)와 가장 강하게 맞는 1개를 고른 값입니다.
+- 표본이 너무 적거나 해석이 불안정하면 `primary_driver`를 `NONE`으로 둡니다.
+- 태그(`tag`)는 `NORMAL`, `LOW_VOL`, `NEW`, `GONE`, `UNDEFINED`를 사용합니다.
+  - `LOW_VOL`: `Clicks_curr_sum < 100` 또는 `Orders_curr_sum < 5`
+  - `NEW`: 전년 매출 0, 올해 매출 > 0
+  - `GONE`: 전년 매출 > 0, 올해 매출 0
+  - `UNDEFINED`: 로그분해 불가 케이스
+
+### 용어만 빠르게
+- `LMDI`: 총 변화액을 항목별로 분해하는 방법
+- `residual`: 분해 후 남는 자투리 오차
+- `dlog`: 전년 대비 변화의 방향과 강도를 함께 보는 점수
+
+### 리포트에서 이렇게 보시면 됩니다
+- `Impact_adj < 0`: 매출 하락에 기여(이슈 후보)
+- `Impact_adj > 0`: 매출 상승에 기여(개선 후보)
+- `primary_driver = CPC/CVR/AOV`: 액션 우선순위를 둘 핵심 원인
+- `tag = LOW_VOL/UNDEFINED`: 해석 신뢰도 주의
+
+### Reporting Split (`src/application/reporting/`)
+- `metrics.py`: 공통 수치/포맷
+- `lmdi.py`: division 병렬 기여도(Impact_raw_method, residual 보정, decline/growth 기여율 산출)
+- `selectors.py`: Top3 추출 전략
+- `rendering.py`: 최종 코멘트 텍스트
+
+## 4) 현재 디렉터리 구조
 
 ```text
 marketing_orchestrator/
@@ -89,7 +186,7 @@ marketing_orchestrator/
       html_report_legacy.py
 ```
 
-## 4) 실행 플로우 (현재 코드 기준)
+## 5) 실행 플로우 (현재 코드 기준)
 
 1. `data/raw/input.xlsx` 로드
 2. 스키마 정규화(wide/long 자동 감지), OBJECTIVE/DIVISION 필터, MTD 정렬
@@ -100,7 +197,11 @@ marketing_orchestrator/
 7. `summary.json`, `summary.html`, `summary.xlsx` 생성
 8. 단계별 실행 시간 로그 출력
 
-## 5) 데이터 계약 (Input Contract)
+연도 결정 규칙(코드 기준):
+- 우선순위: CLI 인자(`--curr-year`, `--prev-year`) > 환경변수(`ROAS_CURRENT_YEAR`, `ROAS_PREVIOUS_YEAR`) > 시스템 현재연도/전년
+- 한쪽 연도만 지정되면 다른 한쪽은 자동 보정 (`curr`만 있으면 `prev=curr-1`, `prev`만 있으면 `curr=prev+1`)
+
+## 6) 데이터 계약 (Input Contract)
 
 ### A. 공통 차원 컬럼
 - `SUBSIDIARY`, `CHANNEL`, `DIVISION`, `PRODUCT`
@@ -118,33 +219,38 @@ marketing_orchestrator/
 - OBJECTIVE: `CONVERSION`만 사용
 - DIVISION: `MX`, `VD`, `DA`만 사용
 - 연도: 비교 2개 연도(`curr_year`, `prev_year`)
-- MTD: 현재연도 최대 월/일 기준으로 과거연도도 동일 컷오프 정렬
+- MTD: 현재연도 최대 월의 1일~최대일 기준으로, 과거연도도 동일 월/일 컷오프 정렬
 
-## 6) 실행 방법
+## 7) 실행 방법
 
-## 사전 준비
+### 사전 준비
 - Python 3.10+
 - 권장 패키지: `polars`, `openpyxl`
 
-## 입력 파일 위치
+### 입력 파일 위치
 - `marketing_orchestrator/data/raw/input.xlsx`
 
-## 실행
+### 실행
 ```bash
 cd marketing_orchestrator
 python main.py
 ```
 
-## 연도 지정 실행
+### 연도 지정 실행
 ```bash
 python main.py --curr-year 2026 --prev-year 2025
 ```
 
-## 7) 설정값 (Environment Variables)
+## 8) 설정값 (Environment Variables)
 
 - `ROAS_CURRENT_YEAR`: `--curr-year` 미지정 시 현재연도 오버라이드
 - `ROAS_PREVIOUS_YEAR`: `--prev-year` 미지정 시 전년 오버라이드
 - `ROAS_PARSE_ERROR_THRESHOLD`: 숫자 파싱 실패 허용 비율 (기본 `0.01`)
+- `ROAS_PARSE_ERROR_THRESHOLD`는 `0~1` 범위만 허용 (범위 밖이면 즉시 예외)
+
+연도 보정 규칙:
+- `ROAS_CURRENT_YEAR`만 주면 `prev = curr - 1`
+- `ROAS_PREVIOUS_YEAR`만 주면 `curr = prev + 1`
 
 예시:
 ```bash
@@ -152,10 +258,10 @@ set ROAS_PARSE_ERROR_THRESHOLD=0.02
 python main.py
 ```
 
-## 8) 산출물 (Output)
+## 9) 산출물 (Output)
 
 - `marketing_orchestrator/output/summary.json`
-  - 비교 메타, 분해 방법 설명, division 병렬기여도, 법인별 리포트, 이슈/개선 Top3 포함
+  - 비교 메타(`comparison_meta`), 분해 방법(`decomposition_method`), division 병렬기여도(`division_parallel_contribution`), 법인별 리포트, 이슈/개선 Top3 포함
 - `marketing_orchestrator/output/summary.html`
   - 요약용 HTML 리포트
 - `marketing_orchestrator/output/summary.xlsx`
@@ -164,24 +270,6 @@ python main.py
   - 입력 정규화 결과 캐시(parquet + meta)
 
 참고: `data/`, `output/`은 `.gitignore`에 의해 기본적으로 버전관리 제외됩니다.
-
-## 9) 주요 알고리즘 요약
-
-### ImpactEngine (`src/impact.py`)
-- 계층: `SUBSIDIARY -> CHANNEL -> DIVISION -> PRODUCT`
-- LMDI 기반 `Impact_raw` 계산 + 조건 불충족 시 delta fallback
-- 잔차 보정 후 `Impact_adj` 생성
-- drill rule(`SINGLE`, `WIDE_NEG`, `WIDE_POS`) 기반 후보 선정
-
-### RootCauseEngine (`src/root_cause.py`)
-- `dlog_CVR`, `dlog_AOV`, `dlog_CPC`로 ROAS 변화 요인 분해
-- 태그(`LOW_VOL`, `NEW`, `GONE`, `UNDEFINED`, `NORMAL`) 및 primary driver 산출
-
-### Reporting Split (`src/application/reporting/`)
-- `metrics.py`: 공통 수치/포맷
-- `lmdi.py`: division 병렬 기여도
-- `selectors.py`: Top3 추출 전략
-- `rendering.py`: 최종 코멘트 텍스트
 
 ## 10) 운영/장애 대응
 
@@ -215,5 +303,5 @@ src.run_reporting_pipeline(curr_year=2026, prev_year=2025)
 ## 12) 현재 인터페이스 상태
 
 - 권장 엔트리포인트: `marketing_orchestrator/main.py`
-- 오케스트레이션 API: `src.application.run_reporting_pipeline`
+- 오케스트레이션 API: `from src.application import run_reporting_pipeline`
 - 레거시 HTML 렌더러는 `src/infrastructure/html_report_legacy.py`로 이동되어 인프라 계층으로 격리되었습니다.

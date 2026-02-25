@@ -1,4 +1,4 @@
-﻿"""HTML report generator for issue + driver topics by SUBSIDIARY."""
+"""HTML report generator for issue + driver topics by SUBSIDIARY."""
 
 from __future__ import annotations
 
@@ -348,7 +348,7 @@ def _action_text(mode: str, driver: str) -> str:
         if driver == "CVR":
             return "유입 의도(키워드/오디언스)와 랜딩 메시지 정합성 개선으로 전환 효율 복원"
         if driver == "AOV":
-            return "tROAS 상향/세분화 + 고가 SKU(예: S25 Ultra, 1TB) 유입 비중 확대"
+            return "tROAS 상향/세분화 + 고가 SKU 유입 비중 확대"
         return "핵심 퍼널 지표 재점검 후 타게팅/입찰 규칙 재설정"
     if driver == "CPC":
         return "저CPC·고CTR 세그먼트 점진 증액으로 효율 유지"
@@ -373,7 +373,7 @@ def _checklist_text(mode: str, driver: str) -> str:
         return "1) 고CVR 키워드/오디언스 확장; 2) 승자 랜딩/소재 복제; 3) 스케일 시 CVR 하락 가드레일 설정"
     if driver == "AOV":
         if mode == "ISSUE":
-            return "1) tROAS 목표 상향/세분화; 2) 고가 SKU(예: S25 Ultra, 1TB) 키워드/오디언스 확대; 3) 저객단가 쿼리/지면 입찰 하향"
+            return "1) tROAS 목표 상향/세분화; 2) 고가 SKU 키워드/오디언스 확대; 3) 저객단가 쿼리/지면 입찰 하향"
         return "1) tROAS 유지로 고가 구매 유저 탐색 확대; 2) 고AOV SKU/번들 키워드 점유율 유지; 3) 할인 중심 유입 비중 과다 점검"
     return "1) 타게팅/입찰/소재 기본 세팅 점검; 2) 트래픽 품질 점검; 3) 예산 배분 재검토"
 
@@ -611,6 +611,10 @@ def _build_topic_html(
         "</section>"
         "</div>"
         f"<p class=\"overall\"><strong>전체 코멘트:</strong> {overall_html}</p>"
+        "<section>"
+        f"<h5>BU 내 Product 실적 ({escape(product)})</h5>"
+        f"{_render_metric_table(product_metrics)}"
+        "</section>"
         f"<p class=\"detail\"><strong>상세 코멘트:</strong> {detail_html}</p>"
         "</article>"
     )
@@ -820,6 +824,38 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
     prev_year = comparison_meta.get("prev_year", "")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    mtd_applied = bool(comparison_meta.get("mtd_applied", False))
+    mtd_month_start = int(comparison_meta.get("mtd_month_start", 0) or 0)
+    mtd_month_cutoff = int(comparison_meta.get("mtd_month_cutoff", 0) or 0)
+    mtd_day_start = int(comparison_meta.get("mtd_day_start", 0) or 0)
+    mtd_day_cutoff = int(comparison_meta.get("mtd_day_cutoff", 0) or 0)
+    if mtd_applied and curr_year and prev_year and mtd_month_start and mtd_month_cutoff and mtd_day_start and mtd_day_cutoff:
+        curr_mtd = f"{int(curr_year):04d}-{mtd_month_start:02d}-{mtd_day_start:02d} ~ {int(curr_year):04d}-{mtd_month_cutoff:02d}-{mtd_day_cutoff:02d}"
+        prev_mtd = f"{int(prev_year):04d}-{mtd_month_start:02d}-{mtd_day_start:02d} ~ {int(prev_year):04d}-{mtd_month_cutoff:02d}-{mtd_day_cutoff:02d}"
+        mtd_meta_text = f"MTD range: {curr_mtd} (YoY window: {prev_mtd})"
+    else:
+        mtd_meta_text = "MTD range: not applied"
+
+    source_format = str(comparison_meta.get("source_format", "unknown") or "unknown")
+    division_applied = bool(comparison_meta.get("division_filter_applied", False))
+    division_values = comparison_meta.get("division_filter_values", [])
+    if isinstance(division_values, list) and division_values:
+        division_text = ",".join(str(v) for v in division_values)
+    else:
+        division_text = "N/A"
+    if not division_applied:
+        division_text = "not_applied"
+
+    objective_applied = bool(comparison_meta.get("objective_filter_applied", False))
+    objective_column = str(comparison_meta.get("objective_column", "") or "")
+    objective_value = str(comparison_meta.get("objective_value", "") or "")
+    objective_text = f"{objective_column}={objective_value}" if objective_applied and objective_column else "not_applied"
+
+    query_meta_text = (
+        f"Query conditions: year {curr_year} vs {prev_year} | source_format={source_format} | "
+        f"division_filter={division_text} | objective_filter={objective_text}"
+    )
+
     summary_lines_html = "".join(f"<li class=\"summary-line\">{escape(line)}</li>" for line in summary_lines)
     if not summary_lines_html:
         summary_lines_html = "<li class=\"summary-line muted\">요약할 국가 데이터가 없습니다.</li>"
@@ -967,7 +1003,8 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
   <div class="wrap">
     <section class="panel">
       <h1>Weekly ROAS Topic Report</h1>
-      <div class="meta">기준: OBJECTIVE=CONVERSION | 비교: {escape(str(curr_year))} vs {escape(str(prev_year))} | 생성시각: {escape(generated_at)}</div>
+      <div class="meta">{escape(query_meta_text)}</div>
+      <div class="meta">{escape(mtd_meta_text)} | generated_at: {escape(generated_at)}</div>
     </section>
     <section class="panel">
       <h2>Global Summary</h2>
@@ -982,4 +1019,3 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
 """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
-

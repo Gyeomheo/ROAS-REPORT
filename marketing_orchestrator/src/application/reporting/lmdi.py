@@ -13,7 +13,6 @@ from src.application.reporting.metrics import (
     safe_log_ratio_expr,
     safe_pct_change,
     safe_pct_change_expr,
-    safe_ratio,
     safe_ratio_expr,
     to_float,
 )
@@ -69,15 +68,17 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
         .agg(sum_aggregations_full())
         .with_columns(
             [
-                pl.col("Revenue_curr_sum").alias("Parent_revenue_curr_sum"),
-                pl.col("Revenue_prev_sum").alias("Parent_revenue_prev_sum"),
+                safe_ratio_expr(pl.col("Revenue_curr_sum"), pl.col("Spend_curr_sum")).alias("Parent_roas_curr"),
+                safe_ratio_expr(pl.col("Revenue_prev_sum"), pl.col("Spend_prev_sum")).alias("Parent_roas_prev"),
+                pl.col("Spend_curr_sum").alias("Parent_spend_curr_sum"),
+                pl.col("Spend_prev_sum").alias("Parent_spend_prev_sum"),
             ]
         )
         .with_columns(
             [
-                (pl.col("Parent_revenue_curr_sum") - pl.col("Parent_revenue_prev_sum")).alias("Parent_revenue_delta"),
-                safe_pct_change_expr(pl.col("Parent_revenue_curr_sum"), pl.col("Parent_revenue_prev_sum")).alias(
-                    "Parent_revenue_yoy_pct"
+                (pl.col("Parent_roas_curr") - pl.col("Parent_roas_prev")).alias("Parent_roas_delta"),
+                safe_pct_change_expr(pl.col("Parent_roas_curr"), pl.col("Parent_roas_prev")).alias(
+                    "Parent_roas_yoy_pct"
                 ),
             ]
         )
@@ -86,10 +87,10 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
     parent_rows = parent_df.select(
         [
             "SUBSIDIARY",
-            "Parent_revenue_curr_sum",
-            "Parent_revenue_prev_sum",
-            "Parent_revenue_delta",
-            "Parent_revenue_yoy_pct",
+            "Parent_roas_curr",
+            "Parent_roas_prev",
+            "Parent_roas_delta",
+            "Parent_roas_yoy_pct",
         ]
     ).to_dicts()
 
@@ -102,10 +103,10 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
         return [
             {
                 "SUBSIDIARY": str(row.get("SUBSIDIARY", "")),
-                "Parent_revenue_curr_sum": to_float(row.get("Parent_revenue_curr_sum")),
-                "Parent_revenue_prev_sum": to_float(row.get("Parent_revenue_prev_sum")),
-                "Parent_revenue_delta": to_float(row.get("Parent_revenue_delta")),
-                "Parent_revenue_yoy_pct": row.get("Parent_revenue_yoy_pct"),
+                "Parent_roas_curr": row.get("Parent_roas_curr"),
+                "Parent_roas_prev": row.get("Parent_roas_prev"),
+                "Parent_roas_delta": to_float(row.get("Parent_roas_delta")),
+                "Parent_roas_yoy_pct": row.get("Parent_roas_yoy_pct"),
                 "rows": [],
             }
             for row in parent_rows
@@ -114,20 +115,32 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
     parent_join_df = parent_df.select(
         [
             "SUBSIDIARY",
-            "Parent_revenue_curr_sum",
-            "Parent_revenue_prev_sum",
-            "Parent_revenue_delta",
+            "Parent_roas_curr",
+            "Parent_roas_prev",
+            "Parent_roas_delta",
+            "Parent_spend_curr_sum",
+            "Parent_spend_prev_sum",
         ]
     )
     joined = division_df.join(parent_join_df, on="SUBSIDIARY", how="left")
-    child_log_mean = log_mean_expr(pl.col("Revenue_curr_sum"), pl.col("Revenue_prev_sum"))
-    parent_log_mean = log_mean_expr(pl.col("Parent_revenue_curr_sum"), pl.col("Parent_revenue_prev_sum"))
-    parent_log_ratio = safe_log_ratio_expr(pl.col("Parent_revenue_curr_sum"), pl.col("Parent_revenue_prev_sum"))
+    child_roas_component_curr = (
+        pl.when(pl.col("Parent_spend_curr_sum") > 0)
+        .then(pl.col("Revenue_curr_sum") / pl.col("Parent_spend_curr_sum"))
+        .otherwise(None)
+    )
+    child_roas_component_prev = (
+        pl.when(pl.col("Parent_spend_prev_sum") > 0)
+        .then(pl.col("Revenue_prev_sum") / pl.col("Parent_spend_prev_sum"))
+        .otherwise(None)
+    )
+    child_log_mean = log_mean_expr(child_roas_component_curr, child_roas_component_prev)
+    parent_log_mean = log_mean_expr(pl.col("Parent_roas_curr"), pl.col("Parent_roas_prev"))
+    parent_log_ratio = safe_log_ratio_expr(pl.col("Parent_roas_curr"), pl.col("Parent_roas_prev"))
     valid_lmdi = (
-        (pl.col("Revenue_curr_sum") > 0)
-        & (pl.col("Revenue_prev_sum") > 0)
-        & (pl.col("Parent_revenue_curr_sum") > 0)
-        & (pl.col("Parent_revenue_prev_sum") > 0)
+        (child_roas_component_curr > 0)
+        & (child_roas_component_prev > 0)
+        & (pl.col("Parent_roas_curr") > 0)
+        & (pl.col("Parent_roas_prev") > 0)
         & child_log_mean.is_not_null()
         & parent_log_mean.is_not_null()
         & parent_log_ratio.is_not_null()
@@ -135,10 +148,12 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
     joined = joined.with_columns(
         [
             pl.when(valid_lmdi)
-            .then((child_log_mean / parent_log_mean) * parent_log_ratio * pl.col("Parent_revenue_delta"))
-            .otherwise(pl.col("Revenue_curr_sum") - pl.col("Revenue_prev_sum"))
+            .then((child_log_mean / parent_log_mean) * parent_log_ratio * pl.col("Parent_roas_delta"))
+            .otherwise(child_roas_component_curr - child_roas_component_prev)
             .alias("Impact_raw"),
-            pl.when(valid_lmdi).then(pl.lit("LMDI")).otherwise(pl.lit("DELTA_FALLBACK")).alias("Impact_raw_method"),
+            pl.when(valid_lmdi).then(pl.lit("LMDI_ROAS")).otherwise(pl.lit("ROAS_COMPONENT_DELTA_FALLBACK")).alias(
+                "Impact_raw_method"
+            ),
         ]
     )
 
@@ -151,19 +166,19 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
                 pl.len().alias("Child_count"),
             ]
         )
-        .join(parent_join_df.select(["SUBSIDIARY", "Parent_revenue_delta"]), on="SUBSIDIARY", how="left")
-        .with_columns((pl.col("Parent_revenue_delta") - pl.col("Impact_raw_sum")).alias("Residual_parent"))
+        .join(parent_join_df.select(["SUBSIDIARY", "Parent_roas_delta"]), on="SUBSIDIARY", how="left")
+        .with_columns((pl.col("Parent_roas_delta") - pl.col("Impact_raw_sum")).alias("Residual_parent"))
         .select(["SUBSIDIARY", "Residual_parent", "Abs_impact_raw_sum", "Child_count"])
     )
 
     contribution_label_expr = (
-        pl.when(pl.col("Parent_revenue_delta") < 0)
+        pl.when(pl.col("Parent_roas_delta") < 0)
         .then(
             pl.when(pl.col("Impact_adj") < 0)
             .then(pl.lit("DECLINE_DRIVER"))
             .otherwise(pl.lit("DECLINE_OFFSET"))
         )
-        .when(pl.col("Parent_revenue_delta") > 0)
+        .when(pl.col("Parent_roas_delta") > 0)
         .then(
             pl.when(pl.col("Impact_adj") > 0)
             .then(pl.lit("GROWTH_DRIVER"))
@@ -195,8 +210,9 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
         )
         .with_columns(
             [
+                (pl.col("ROAS_curr") - pl.col("ROAS_prev")).alias("ROAS_delta"),
                 safe_pct_change_expr(pl.col("ROAS_curr"), pl.col("ROAS_prev")).alias("ROAS_yoy_pct"),
-                pl.col("Parent_revenue_delta").abs().alias("__parent_abs_delta"),
+                pl.col("Parent_roas_delta").abs().alias("__parent_abs_delta"),
             ]
         )
         .with_columns(
@@ -205,14 +221,14 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
                 .then(pl.col("Impact_adj").abs() / pl.col("__parent_abs_delta"))
                 .otherwise(0.0)
                 .alias("Contribution_to_total_delta_pct"),
-                pl.when((pl.col("Parent_revenue_delta") < 0) & (pl.col("__parent_abs_delta") > 0))
+                pl.when((pl.col("Parent_roas_delta") < 0) & (pl.col("__parent_abs_delta") > 0))
                 .then(
                     pl.when(pl.col("Impact_adj") < 0).then(-pl.col("Impact_adj")).otherwise(0.0)
                     / pl.col("__parent_abs_delta")
                 )
                 .otherwise(0.0)
                 .alias("Contribution_to_decline_pct"),
-                pl.when((pl.col("Parent_revenue_delta") > 0) & (pl.col("__parent_abs_delta") > 0))
+                pl.when((pl.col("Parent_roas_delta") > 0) & (pl.col("__parent_abs_delta") > 0))
                 .then(
                     pl.when(pl.col("Impact_adj") > 0).then(pl.col("Impact_adj")).otherwise(0.0)
                     / pl.col("__parent_abs_delta")
@@ -236,13 +252,14 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
                 "Spend_yoy_pct",
                 "ROAS_curr",
                 "ROAS_prev",
+                "ROAS_delta",
                 "ROAS_yoy_pct",
                 "Impact_raw",
                 "Impact_adj",
                 "Impact_raw_method",
                 "Residual_parent",
                 "Residual_applied_flag",
-                "Parent_revenue_delta",
+                "Parent_roas_delta",
                 "Contribution_to_total_delta_pct",
                 "Contribution_to_decline_pct",
                 "Contribution_to_growth_pct",
@@ -254,30 +271,29 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
     rows_by_sub: Dict[str, List[Dict[str, Any]]] = {}
     for row in contribution_df.sort(["SUBSIDIARY", "DIVISION"]).to_dicts():
         subsidiary = str(row.get("SUBSIDIARY", ""))
-        parent_delta = to_float(row.get("Parent_revenue_delta"))
+        parent_delta = to_float(row.get("Parent_roas_delta"))
         division_name = str(row.get("DIVISION", "DIVISION"))
-        rev_yoy = row.get("Revenue_yoy_pct")
         roas_curr = row.get("ROAS_curr")
         roas_yoy = row.get("ROAS_yoy_pct")
         if parent_delta < 0:
             summary_text = (
-                f"{division_name} 매출 {fmt_pct(rev_yoy)} / ROAS {fmt_roas(roas_curr)}({fmt_pct(roas_yoy)}) "
-                f"기준, 전체 하락 기여도 {fmt_pct(row.get('Contribution_to_decline_pct'), signed=False)}"
+                f"{division_name} ROAS {fmt_roas(roas_curr)}({fmt_pct(roas_yoy)}) "
+                f"기준, 전체 ROAS 하락 기여도 {fmt_pct(row.get('Contribution_to_decline_pct'), signed=False)}"
             )
         elif parent_delta > 0:
             summary_text = (
-                f"{division_name} 매출 {fmt_pct(rev_yoy)} / ROAS {fmt_roas(roas_curr)}({fmt_pct(roas_yoy)}) "
-                f"기준, 전체 성장 기여도 {fmt_pct(row.get('Contribution_to_growth_pct'), signed=False)}"
+                f"{division_name} ROAS {fmt_roas(roas_curr)}({fmt_pct(roas_yoy)}) "
+                f"기준, 전체 ROAS 성장 기여도 {fmt_pct(row.get('Contribution_to_growth_pct'), signed=False)}"
             )
         else:
-            summary_text = f"{division_name} 매출 {fmt_pct(rev_yoy)} / ROAS {fmt_roas(roas_curr)}({fmt_pct(roas_yoy)})"
+            summary_text = f"{division_name} ROAS {fmt_roas(roas_curr)}({fmt_pct(roas_yoy)})"
         row["summary_text"] = summary_text
         rows_by_sub.setdefault(subsidiary, []).append(row)
 
     output: List[Dict[str, Any]] = []
     for parent in parent_rows:
         subsidiary = str(parent.get("SUBSIDIARY", ""))
-        parent_delta = to_float(parent.get("Parent_revenue_delta"))
+        parent_delta = to_float(parent.get("Parent_roas_delta"))
         rows = rows_by_sub.get(subsidiary, [])
         if parent_delta < 0:
             rows.sort(
@@ -301,15 +317,14 @@ def division_parallel_contribution(df: pl.DataFrame) -> List[Dict[str, Any]]:
         output.append(
             {
                 "SUBSIDIARY": subsidiary,
-                "Parent_revenue_curr_sum": to_float(parent.get("Parent_revenue_curr_sum")),
-                "Parent_revenue_prev_sum": to_float(parent.get("Parent_revenue_prev_sum")),
-                "Parent_revenue_delta": parent_delta,
-                "Parent_revenue_yoy_pct": safe_pct_change(
-                    to_float(parent.get("Parent_revenue_curr_sum")),
-                    to_float(parent.get("Parent_revenue_prev_sum")),
+                "Parent_roas_curr": parent.get("Parent_roas_curr"),
+                "Parent_roas_prev": parent.get("Parent_roas_prev"),
+                "Parent_roas_delta": parent_delta,
+                "Parent_roas_yoy_pct": safe_pct_change(
+                    parent.get("Parent_roas_curr"),
+                    parent.get("Parent_roas_prev"),
                 ),
                 "rows": rows,
             }
         )
     return output
-

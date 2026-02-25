@@ -176,22 +176,37 @@ class ImpactEngine:
             child_df = child_df.filter(pl.col(dim) == pl.lit(parent_ctx[dim]))
 
         if child_df.is_empty():
-            return child_df, {"parent_delta": 0.0, "parent_prev_revenue": 0.0}
+            return child_df, {"parent_delta": 0.0, "parent_prev_roas": 0.0}
 
         parent_totals = self._get_parent_totals(parent_depth, parent_ctx)
-        parent_curr = self._to_float(parent_totals.get("Revenue_curr_sum"))
-        parent_prev = self._to_float(parent_totals.get("Revenue_prev_sum"))
-        parent_delta = parent_curr - parent_prev
+        parent_rev_curr = self._to_float(parent_totals.get("Revenue_curr_sum"))
+        parent_rev_prev = self._to_float(parent_totals.get("Revenue_prev_sum"))
+        parent_spend_curr = self._to_float(parent_totals.get("Spend_curr_sum"))
+        parent_spend_prev = self._to_float(parent_totals.get("Spend_prev_sum"))
+        parent_roas_curr = parent_rev_curr / parent_spend_curr if parent_spend_curr > 0 else None
+        parent_roas_prev = parent_rev_prev / parent_spend_prev if parent_spend_prev > 0 else None
+        parent_delta = self._to_float(parent_roas_curr) - self._to_float(parent_roas_prev)
 
-        log_mean_child = self._log_mean_expr(pl.col("Revenue_curr_sum"), pl.col("Revenue_prev_sum"))
-        log_mean_parent = self._log_mean_expr(pl.lit(parent_curr), pl.lit(parent_prev))
-        log_ratio_parent = self._safe_log_ratio_expr(pl.lit(parent_curr), pl.lit(parent_prev))
+        child_roas_component_curr = (
+            pl.when(pl.lit(parent_spend_curr) > 0)
+            .then(pl.col("Revenue_curr_sum") / pl.lit(parent_spend_curr))
+            .otherwise(None)
+        )
+        child_roas_component_prev = (
+            pl.when(pl.lit(parent_spend_prev) > 0)
+            .then(pl.col("Revenue_prev_sum") / pl.lit(parent_spend_prev))
+            .otherwise(None)
+        )
+
+        log_mean_child = self._log_mean_expr(child_roas_component_curr, child_roas_component_prev)
+        log_mean_parent = self._log_mean_expr(pl.lit(parent_roas_curr), pl.lit(parent_roas_prev))
+        log_ratio_parent = self._safe_log_ratio_expr(pl.lit(parent_roas_curr), pl.lit(parent_roas_prev))
 
         valid_lmdi = (
-            (pl.col("Revenue_curr_sum") > 0)
-            & (pl.col("Revenue_prev_sum") > 0)
-            & (pl.lit(parent_curr) > 0)
-            & (pl.lit(parent_prev) > 0)
+            (child_roas_component_curr > 0)
+            & (child_roas_component_prev > 0)
+            & (pl.lit(parent_roas_curr) > 0)
+            & (pl.lit(parent_roas_prev) > 0)
             & log_mean_child.is_not_null()
             & log_mean_parent.is_not_null()
             & log_ratio_parent.is_not_null()
@@ -214,7 +229,7 @@ class ImpactEngine:
                     * pl.col("__parent_log_ratio")
                     * pl.lit(parent_delta)
                 )
-                .otherwise(pl.col("Revenue_curr_sum") - pl.col("Revenue_prev_sum"))
+                .otherwise(child_roas_component_curr - child_roas_component_prev)
                 .alias("Impact_raw")
             )
         )
@@ -270,13 +285,13 @@ class ImpactEngine:
 
         child_adj = child_adj.select(self.RESULT_COLUMNS + ["__path_key"]).sort(child_dims)
 
-        return child_adj, {"parent_delta": parent_delta, "parent_prev_revenue": parent_prev}
+        return child_adj, {"parent_delta": parent_delta, "parent_prev_roas": self._to_float(parent_roas_prev)}
 
     def _select_children(
         self,
         child_df: pl.DataFrame,
         child_dims: List[str],
-        parent_prev_revenue: float,
+        parent_prev_roas: float,
         parent_delta: float,
     ) -> Tuple[pl.DataFrame, Dict[str, Any]]:
         if child_df.is_empty():
@@ -291,7 +306,7 @@ class ImpactEngine:
         top1_share = self._to_float(top_rows[0].get("Share_childsum"))
         top2_share = self._to_float(top_rows[1].get("Share_childsum")) if len(top_rows) > 1 else 0.0
         top1_impact_abs = abs(self._to_float(top_rows[0].get("Impact_adj")))
-        impact_floor = max(self.abs_floor_amount, max(parent_prev_revenue, 0.0) * self.rel_floor)
+        impact_floor = max(self.abs_floor_amount, abs(parent_prev_roas) * self.rel_floor)
 
         single_drill = (
             top1_share >= 0.45
@@ -344,7 +359,7 @@ class ImpactEngine:
                 selected, selection_meta = self._select_children(
                     child_imp,
                     child_dims,
-                    parent_prev_revenue=parent_meta["parent_prev_revenue"],
+                    parent_prev_roas=parent_meta["parent_prev_roas"],
                     parent_delta=parent_meta["parent_delta"],
                 )
 

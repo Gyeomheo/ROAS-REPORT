@@ -7,10 +7,22 @@ from typing import Any, Dict, List
 from src.application.reporting.metrics import safe_pct_change, to_float
 
 
+def _topic_roas_delta(item: Dict[str, Any]) -> float | None:
+    direct = item.get("topic_roas_delta")
+    if direct is not None:
+        return to_float(direct)
+
+    roas_curr = item.get("ROAS_curr")
+    roas_prev = item.get("ROAS_prev")
+    if roas_curr is None or roas_prev is None:
+        return None
+    return to_float(roas_curr) - to_float(roas_prev)
+
+
 def top3_by_subsidiary(
     rows: List[Dict[str, Any]],
     descending: bool,
-    min_topic_impact_pct: float = 0.03,
+    min_topic_roas_abs_delta: float = 0.03,
 ) -> Dict[str, List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -19,6 +31,9 @@ def top3_by_subsidiary(
 
     for sub in grouped:
         def _metric(item: Dict[str, Any]) -> float:
+            roas_delta = _topic_roas_delta(item)
+            if roas_delta is not None:
+                return abs(roas_delta)
             pct = item.get("impact_contribution_pct")
             if pct is not None:
                 return to_float(pct)
@@ -52,9 +67,10 @@ def top3_by_subsidiary(
             return False
 
         def _is_actionable(item: Dict[str, Any]) -> bool:
-            pct = item.get("impact_contribution_pct")
-            low_impact = pct is None or to_float(pct) < min_topic_impact_pct
-            return _has_yoy_basis(item) or not low_impact
+            roas_delta = _topic_roas_delta(item)
+            if roas_delta is None:
+                return _has_yoy_basis(item)
+            return _has_yoy_basis(item) or abs(roas_delta) >= min_topic_roas_abs_delta
 
         candidates = [item for item in grouped[sub] if _is_actionable(item)]
 
@@ -112,11 +128,14 @@ def choose_subsidiary_mode(
     issues_by_sub: Dict[str, List[Dict[str, Any]]],
     improves_by_sub: Dict[str, List[Dict[str, Any]]],
 ) -> tuple[str, List[Dict[str, Any]]]:
-    rev_delta = to_float(perf.get("rev_delta"))
+    roas_delta = perf.get("roas_delta")
+    if roas_delta is None:
+        roas_delta = perf.get("rev_delta")
+    roas_delta_value = to_float(roas_delta)
     issues = issues_by_sub.get(subsidiary, [])
     improves = improves_by_sub.get(subsidiary, [])
 
-    if rev_delta < 0:
+    if roas_delta_value < 0:
         if issues:
             return "ISSUE", issues
         return "IMPROVE", improves
@@ -126,4 +145,3 @@ def choose_subsidiary_mode(
     if issues:
         return "ISSUE", issues
     return "IMPROVE", improves
-
