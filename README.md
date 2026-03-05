@@ -1,12 +1,12 @@
 # ROAS Report Orchestrator
 
-이 도구는 **작년 같은 기간 대비 매출이 왜 변했는지**를 자동으로 설명해주는 주간 마케팅 리포트 생성기입니다.  
+이 도구는 **작년 같은 기간 대비 ROAS(광고 효율)가 왜 변했는지**를 자동으로 설명해주는 주간 마케팅 리포트 생성기입니다.  
 핵심 목적은 마케터가 매체/사업부/상품 단위 원인을 빠르게 찾고, 바로 실행할 액션까지 결정하게 돕는 것입니다.
 
 ## 마케터 관점에서 이 도구가 하는 일
 
 1. 성과 Excel을 읽어 분석 가능한 형태로 자동 정리합니다.
-2. 매출 변화에 영향이 큰 이슈/개선 Top 항목을 우선순위로 뽑습니다.
+2. ROAS 변화에 영향이 큰 이슈/개선 Top 항목을 우선순위로 뽑습니다.
 3. 변화 원인을 `CPC`, `CVR`, `AOV` 중 무엇이 주도했는지 알려줍니다.
 4. 항목별 권장 액션과 체크리스트를 같이 제시합니다.
 5. 공유 가능한 결과물(JSON/HTML/Excel)을 한 번에 생성합니다.
@@ -25,7 +25,7 @@ main.py (CLI Entrypoint)
           -> ingestion.read_input_excel (Polars-first, openpyxl fallback, DQ check)
           -> output/.cache parquet/meta (입력 캐시)
       -> application.analysis_service.run_subsidiary_analysis
-          -> ImpactEngine (LMDI 기반 매출 기여 분해 + residual 잔차 보정 + drill-down)
+          -> ImpactEngine (LMDI 기반 ROAS 기여 분해 + residual 잔차 보정 + drill-down)
           -> RootCauseEngine (dlog(=delta-log) 기반 driver 추정)
           -> campaign_action_service (도메인 액션 문구/체크리스트)
       -> application.reporting.*
@@ -64,7 +64,7 @@ main.py (CLI Entrypoint)
 ## 3) 주요 알고리즘 요약 (마케터 버전)
 
 ### 먼저 한 줄로
-- `ImpactEngine`: 무엇이 매출 증감에 얼마나 영향을 줬는지 찾는 단계
+- `ImpactEngine`: 무엇이 ROAS 변화에 얼마나 영향을 줬는지 찾는 단계
 - `RootCauseEngine`: 그 변화가 `CPC/CVR/AOV` 중 무엇 때문인지 찾는 단계
 
 ### ImpactEngine (`src/impact.py`)
@@ -73,26 +73,26 @@ main.py (CLI Entrypoint)
 `LMDI` 상세:
 
 1. 기본 아이디어  
-   부모 매출 변화액(`Parent_revenue_delta`)을 자식 항목(예: division, product)별 기여도로 분해합니다.
+   부모 ROAS 변화량(`Parent_roas_delta`)을 자식 항목(예: division, product)별 기여도로 분해합니다.
 
 2. 로그평균(Log-Mean)  
    `L(x, y) = (x - y) / (ln x - ln y)`  
    단, `x == y`면 `L(x, y) = x`로 처리합니다.
 
 3. 1차 기여도 `Impact_raw` 계산  
-   LMDI 유효 조건(부모/자식 현재·전년 매출 모두 양수 + 로그 계산 가능)을 만족하면:
+   LMDI 유효 조건(부모/자식 현재·전년 ROAS 구성값 모두 양수 + 로그 계산 가능)을 만족하면:
 
    ```text
    Impact_raw_i
-   = ( L(Revenue_curr_i, Revenue_prev_i) / L(Parent_curr, Parent_prev) )
-     * ln(Parent_curr / Parent_prev)
-     * (Parent_curr - Parent_prev)
+   = ( L(ROAS_component_curr_i, ROAS_component_prev_i) / L(Parent_roas_curr, Parent_roas_prev) )
+     * ln(Parent_roas_curr / Parent_roas_prev)
+     * (Parent_roas_curr - Parent_roas_prev)
    ```
 
    유효 조건을 만족하지 못하면 안전하게 direct delta fallback:
 
    ```text
-   Impact_raw_i = Revenue_curr_i - Revenue_prev_i
+   Impact_raw_i = ROAS_component_curr_i - ROAS_component_prev_i
    ```
 
 4. residual(잔차) 보정  
@@ -116,7 +116,7 @@ main.py (CLI Entrypoint)
      - 부모 변화가 음수면 `WIDE_NEG` (음수 기여 상위 최대 3개)
      - 부모 변화가 양수면 `WIDE_POS` (양수 기여 상위 최대 3개)
      - 부모 변화가 0이면 `STOP_ZERO_DELTA`
-   - `impact_floor = max(abs_floor_amount, parent_prev_revenue * rel_floor)`
+   - `impact_floor = max(abs_floor_amount, parent_prev_roas * rel_floor)`
 
 ### RootCauseEngine (`src/root_cause.py`)
 - 기본 관계: `ROAS = CVR × AOV ÷ CPC`
@@ -134,7 +134,8 @@ CVR × AOV ÷ CPC
 - `dlog_AOV`가 크고 +면 객단가 개선 영향이 큼
 - `dlog_CPC`가 크고 +면 CPC 악화(비용 상승) 영향이 큼
 - `primary_driver`는 위 3개 중 실제 결과(악화/개선)와 가장 강하게 맞는 1개를 고른 값입니다.
-- 표본이 너무 적거나 해석이 불안정하면 `primary_driver`를 `NONE`으로 둡니다.
+- 표본이 너무 적거나 해석이 불안정하면 RootCauseEngine 단계에서는 `primary_driver`를 `NONE`으로 둡니다.
+- 이후 액션 추천 단계에서 `primary_driver`는 실행 가능성 중심으로 보정될 수 있으며, 신호가 약하면 `CPC`로 fallback될 수 있습니다.
 - 태그(`tag`)는 `NORMAL`, `LOW_VOL`, `NEW`, `GONE`, `UNDEFINED`를 사용합니다.
   - `LOW_VOL`: `Clicks_curr_sum < 100` 또는 `Orders_curr_sum < 5`
   - `NEW`: 전년 매출 0, 올해 매출 > 0
@@ -147,8 +148,8 @@ CVR × AOV ÷ CPC
 - `dlog`: 전년 대비 변화의 방향과 강도를 함께 보는 점수
 
 ### 리포트에서 이렇게 보시면 됩니다
-- `Impact_adj < 0`: 매출 하락에 기여(이슈 후보)
-- `Impact_adj > 0`: 매출 상승에 기여(개선 후보)
+- `Impact_adj < 0`: ROAS 하락에 기여(이슈 후보)
+- `Impact_adj > 0`: ROAS 상승에 기여(개선 후보)
 - `primary_driver = CPC/CVR/AOV`: 액션 우선순위를 둘 핵심 원인
 - `tag = LOW_VOL/UNDEFINED`: 해석 신뢰도 주의
 
@@ -275,7 +276,8 @@ python main.py
 
 ### Excel 저장 실패
 - 파일이 열려 있으면 저장이 실패할 수 있습니다.
-- 파이프라인은 예외를 흡수하고 경고를 출력합니다.
+- `PermissionError`(예: 파일 잠금)는 흡수하고 경고를 출력합니다.
+- 그 외 저장 예외는 상위로 전파되어 파이프라인이 중단될 수 있습니다.
 
 ### 입력 파싱 실패
 - 파싱 실패율이 임계치 초과 시 `ValueError`로 중단됩니다.
