@@ -30,7 +30,11 @@ def enrich_campaign_actions(rows: Sequence[Mapping[str, Any]], dimensions: Seque
         enriched = dict(row)
 
         signals = CampaignSignals.from_row(enriched)
-        primary_driver = confirmed_primary_driver(signals)
+        existing_driver = str(enriched.get("primary_driver", "NONE") or "NONE").upper()
+        if existing_driver in {"CPC", "CVR", "AOV", "NONE"}:
+            primary_driver = existing_driver
+        else:
+            primary_driver = confirmed_primary_driver(signals)
         policy_input = signals.with_primary_driver(primary_driver)
 
         enriched["primary_driver"] = primary_driver

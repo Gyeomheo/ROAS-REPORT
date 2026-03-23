@@ -425,6 +425,15 @@ def _empty_engine_frame() -> pl.DataFrame:
     return pl.DataFrame({column: [] for column in ENGINE_COLUMNS})
 
 
+def _has_activity_expr() -> pl.Expr:
+    return (
+        (pl.col("Spend_curr") > 0)
+        | (pl.col("Spend_prev") > 0)
+        | (pl.col("Revenue_curr") > 0)
+        | (pl.col("Revenue_prev") > 0)
+    )
+
+
 def _filter_conversion_objective(df: pl.DataFrame) -> tuple[pl.DataFrame, Dict[str, Any]]:
     objective_column = next((col for col in OBJECTIVE_CANDIDATES if col in df.columns), None)
     meta: Dict[str, Any] = {
@@ -490,7 +499,7 @@ def _normalize_wide_engine_frame(df: pl.DataFrame) -> pl.DataFrame:
         )
         .select(ENGINE_COLUMNS)
     )
-    return normalized.filter(pl.col("Spend_curr") > 0)
+    return normalized.filter(_has_activity_expr())
 
 
 def _normalize_long_frame(df: pl.DataFrame) -> pl.DataFrame:
@@ -607,7 +616,7 @@ def _pivot_long_to_engine(df: pl.DataFrame, curr_year: int, prev_year: int) -> p
         [pl.col(metric).cast(pl.Float64, strict=False).fill_null(0.0).alias(metric) for metric in ENGINE_METRIC_COLUMNS]
     )
 
-    return pivoted.select(ENGINE_COLUMNS).filter(pl.col("Spend_curr") > 0)
+    return pivoted.select(ENGINE_COLUMNS).filter(_has_activity_expr())
 
 
 def _to_engine_frame(

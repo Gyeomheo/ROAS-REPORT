@@ -835,8 +835,6 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
         mtd_meta_text = f"MTD range: {curr_mtd} (YoY window: {prev_mtd})"
     else:
         mtd_meta_text = "MTD range: not applied"
-
-    source_format = str(comparison_meta.get("source_format", "unknown") or "unknown")
     division_applied = bool(comparison_meta.get("division_filter_applied", False))
     division_values = comparison_meta.get("division_filter_values", [])
     if isinstance(division_values, list) and division_values:
@@ -852,7 +850,7 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
     objective_text = f"{objective_column}={objective_value}" if objective_applied and objective_column else "not_applied"
 
     query_meta_text = (
-        f"Query conditions: year {curr_year} vs {prev_year} | source_format={source_format} | "
+        f"Query conditions: year {curr_year} vs {prev_year} | "
         f"division_filter={division_text} | objective_filter={objective_text}"
     )
 

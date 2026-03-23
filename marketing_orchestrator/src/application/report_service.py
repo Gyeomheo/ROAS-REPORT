@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
-from datetime import date
+import shutil
+from datetime import date, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List
@@ -115,6 +117,11 @@ def _fmt_driver_metric(metric: str, value: float | None) -> str:
     return reporting_metrics.fmt_driver_metric(metric, value)
 
 
+def _driver_label(driver: str | None) -> str:
+    driver_text = str(driver or "").upper()
+    if driver_text in {"CPC", "CVR", "AOV"}:
+        return driver_text
+    return "미확정"
 
 def _trend(value: float | None, eps: float = 1e-9) -> str:
     return reporting_metrics.trend(value, eps=eps)
@@ -216,14 +223,14 @@ def _insight_text(
 
     channel_name = str(row.get("CHANNEL", "CHANNEL"))
     headline = (
-        f"{product_name} | 癲ル슢????{_fmt_money(product_rev_curr)}({_fmt_pct_yoy(product_rev_yoy)}) "
-        f"| ????{_fmt_money(product_spend_curr)}({_fmt_pct_yoy(product_spend_yoy)}) "
+        f"{product_name} | 매출 {_fmt_money(product_rev_curr)}({_fmt_pct_yoy(product_rev_yoy)}) "
+        f"| 투자 {_fmt_money(product_spend_curr)}({_fmt_pct_yoy(product_spend_yoy)}) "
         f"| ROAS {_fmt_roas(product_roas_curr)}({_fmt_pct_yoy(product_roas_yoy)})"
     )
     if mode_tag == "ISSUE":
-        headline = f"{headline} [??嚥??????ル늉筌?"
+        headline = f"{headline} [하락 유발]"
     elif mode_tag in {"IMPROVE", "DEFENSE"} and (channel_rev_yoy is not None and channel_rev_yoy < 0):
-        headline = f"{headline} [癲???紐???嚥??????ㅼ굡??"
+        headline = f"{headline} [채널 하락 상쇄]"
 
     division_spend_curr = _to_float(division_row.get("Spend_curr_sum"))
     division_spend_prev = _to_float(division_row.get("Spend_prev_sum"))
@@ -318,7 +325,7 @@ def _insight_text(
     if product_aov_prev is None:
         product_aov_prev = _safe_ratio(product_rev_prev, product_orders_prev)
 
-    driver = str(row.get("primary_driver", "CPC") or "CPC").upper()
+    driver = str(row.get("primary_driver", "NONE") or "NONE").upper()
     if driver == "AOV":
         product_driver_curr = product_aov_curr
         product_driver_prev = product_aov_prev
@@ -331,13 +338,19 @@ def _insight_text(
         division_driver_curr = division_cvr_curr
         division_driver_prev = division_cvr_prev
         driver_dlog = row.get("dlog_CVR")
-    else:
-        driver = "CPC"
+    elif driver == "CPC":
         product_driver_curr = product_cpc_curr
         product_driver_prev = product_cpc_prev
         division_driver_curr = division_cpc_curr
         division_driver_prev = division_cpc_prev
         driver_dlog = row.get("dlog_CPC")
+    else:
+        driver = "NONE"
+        product_driver_curr = None
+        product_driver_prev = None
+        division_driver_curr = None
+        division_driver_prev = None
+        driver_dlog = None
 
     driver_yoy = _safe_pct_change(product_driver_curr, product_driver_prev)
     division_driver_yoy = _safe_pct_change(division_driver_curr, division_driver_prev)
@@ -351,78 +364,96 @@ def _insight_text(
     driver_dlog_abs = abs(_to_float(driver_dlog))
     signal_max_abs = max(dlog_cvr_abs, dlog_aov_abs, dlog_cpc_abs)
     tag = str(row.get("tag", "") or "").upper()
+    driver_label = _driver_label(driver)
 
     channel_text = (
-        f"1) 癲???紐?{channel_name}: 癲ル슢????{_fmt_money(channel_rev_curr)}({_fmt_pct_yoy(channel_rev_yoy)}), "
-        f"????{_fmt_money(channel_spend_curr)}({_fmt_pct_yoy(channel_spend_yoy)}), "
+        f"1) 채널 {channel_name}: 매출 {_fmt_money(channel_rev_curr)}({_fmt_pct_yoy(channel_rev_yoy)}), "
+        f"투자 {_fmt_money(channel_spend_curr)}({_fmt_pct_yoy(channel_spend_yoy)}), "
         f"ROAS {_fmt_roas(channel_roas_curr)}({_fmt_pct_yoy(channel_roas_yoy)}), "
         f"{contribution_rate_label} {_fmt_pct(channel_direct_pct, signed=False)}"
     )
     division_text = (
-        f"2) BU {division_name}: 癲???紐???癲ル슢????????룔뀋?{_fmt_pct(division_rev_share, signed=False)}, "
-        f"癲ル슢????{_fmt_money(division_rev_curr)}({_fmt_pct_yoy(division_rev_yoy)}), "
-        f"????{_fmt_money(division_spend_curr)}({_fmt_pct_yoy(division_spend_yoy)}), "
+        f"2) BU {division_name}: 채널 내 매출 비중 {_fmt_pct(division_rev_share, signed=False)}, "
+        f"매출 {_fmt_money(division_rev_curr)}({_fmt_pct_yoy(division_rev_yoy)}), "
+        f"투자 {_fmt_money(division_spend_curr)}({_fmt_pct_yoy(division_spend_yoy)}), "
         f"ROAS {_fmt_roas(division_roas_curr)}({_fmt_pct_yoy(division_roas_yoy)}), "
         f"{contribution_rate_label} {_fmt_pct(division_direct_pct, signed=False)}"
     )
     product_text = (
-        f"3) ???? {product_name}: {contribution_rate_label} {_fmt_pct(product_direct_pct, signed=False)}, "
-        f"?????癲ル슣????{driver}"
+        f"3) 제품 {product_name}: {contribution_rate_label} {_fmt_pct(product_direct_pct, signed=False)}, "
+        f"핵심 지표 {driver_label}"
     )
-    if tag == "NEW":
-        evidence_text = (
-            f"4) 癲ル슣?????????琉? ???ル㎦????????⑥????ш끽維????れ삀??????딅텑??釉뚰?轅대쑏?YoY/dlog ???ル굔??ш끽維獒????? "
-            f"??ш끽維??{driver} {_fmt_driver_metric(driver, product_driver_curr)}, "
-            f"BU {driver} {_fmt_driver_metric(driver, division_driver_curr)} ??れ삀?????⑥?????굿癲?"
-        )
-        interpretation_text = (
-            "5) ???⑤똾留? ???ル㎦??????? ??????嶺뚮Ĳ???륁녃域????縕?猿녿뎨????源놁젳???????용뿭???ш낄援?濡γ뀋??뱀떴???맞???⑤베毓?? 癲ル슢?꾤땟?????ㅻ깹??????Β?띾쭡."
-        )
-    elif tag == "LOW_VOL":
-        evidence_text = (
-            f"4) 癲ル슣?????????琉? ???怨뚮옩???????쐠????⑥??YoY ?怨뚮뼚?????쀫렰???? "
-            f"{driver} {_fmt_driver_metric(driver, product_driver_curr)} vs BU {driver} {_fmt_driver_metric(driver, division_driver_curr)} 癲ル슔?蹂앸듋??"
-        )
-        interpretation_text = (
-            "5) ???⑤똾留? ???怨뚮옩???????쐠??? ?????????????????Β??????ш끽維??????????쒒????ㅼ굣??"
-        )
-    else:
-        evidence_text = (
-            f"4) 癲ル슣?????????琉? {driver} {_fmt_driver_metric(driver, product_driver_curr)}"
-            f"({_fmt_pct_yoy(driver_yoy)}), BU {driver} {_fmt_driver_metric(driver, division_driver_curr)}"
-            f"({_fmt_pct_yoy(division_driver_yoy)}), YoY ?濡る큸泳?μ쾸?{_fmt_pp(driver_gap_pp)}. "
-            f"|dlog| {driver} {driver_dlog_abs:.3f} (CVR {dlog_cvr_abs:.3f}, AOV {dlog_aov_abs:.3f}, CPC {dlog_cpc_abs:.3f})"
-        )
 
-        if signal_max_abs < 0.05:
-            interpretation_text = "5) ???⑤똾留? 癲ル슣???????レ챺繹???좊즴甕곗쥉?닺쥈?苡? ???????????????륁녃域?????⑤베毓?????굿癲ル슓???????Β?띾쭡."
-        elif driver == "CPC":
-            if mode_tag == "ISSUE":
-                interpretation_text = (
-                    "5) ???⑤똾留? ???モ섋굢????쒙쭗????⑤８? ???レ챺繹? ?怨뚮옖????嶺뚮Ĳ?됮?? CTR(IMP/CLICK), ??????怨뚮옩??? ???モ섋굢??? ??⑤베毓??"
-                )
-            else:
-                interpretation_text = (
-                    "5) ???⑤똾留? ???モ섋굢????쒙쭗???좊즵獒뺣돀?????レ챺繹? ?怨뚮옖????嶺뚮Ĳ?됮?? CTR(IMP/CLICK) ???, ??????怨뚮옩?????? ???."
-                )
-        elif driver == "CVR":
-            if mode_tag == "ISSUE":
-                interpretation_text = (
-                    "5) ???⑤똾留? ??ш낄援?????쒙쭗????⑤８? ???レ챺繹? ???モ섋굢??嶺뚮ㅎ???????源녿뼥(???源낆맫??????쇨틣?嶺뚮ㅎ?ц짆???筌먲퐢???嶺뚮쮳??? ??? ??ш끽維??"
-                )
-            else:
-                interpretation_text = (
-                    "5) ???⑤똾留? ??ш낄援?????쒙쭗???좊즵獒뺣돀?????レ챺繹? ???モ섋굢??嶺뚮ㅎ???????源녿뼥 ??좊즵獒뺣돀??????筌먲퐢??????됰군 ???ㅺ강?????좊즵獒뺣돀????좊읈????묐빝?"
-                )
+    if tag == "NEW":
+        if driver == "NONE":
+            evidence_text = "4) 지표 근거: 신규 항목으로 전년 기준이 부족해 YoY/dlog 신뢰도는 낮음. 현재는 원인 미확정 상태로 추세 관찰이 우선."
         else:
-            if mode_tag == "ISSUE":
-                interpretation_text = (
-                    "5) ???⑤똾留? AOV ???⑤８??????モ섋굢??嶺뚮ㅎ????雅?퍔瑗???????嚥▲꺃??????좊읈? ???モ섋굢?????룔뀋? ???뽮덫?????レ챺繹?"
-                )
+            evidence_text = (
+                f"4) 지표 근거: 신규 항목으로 전년 기준이 부족해 YoY/dlog 신뢰도는 낮음. "
+                f"현재 {driver_label} {_fmt_driver_metric(driver, product_driver_curr)}, "
+                f"BU {driver_label} {_fmt_driver_metric(driver, division_driver_curr)} 기준으로 관찰."
+            )
+        interpretation_text = "5) 해석: 신규 항목은 원인 확정보다 초기 안정화(클릭·전환·매출 추세) 모니터링이 우선."
+    elif tag == "LOW_VOL":
+        if driver == "NONE":
+            evidence_text = "4) 지표 근거: 저볼륨 구간으로 YoY 변동성이 크고 유효 표본이 부족해 드라이버를 확정하기 어렵습니다."
+        else:
+            evidence_text = (
+                f"4) 지표 근거: 저볼륨 구간으로 YoY 변동성이 큼. "
+                f"{driver_label} {_fmt_driver_metric(driver, product_driver_curr)} vs BU {driver_label} {_fmt_driver_metric(driver, division_driver_curr)} 참고."
+            )
+        interpretation_text = "5) 해석: 저볼륨 구간은 원인 단정 대신 데이터 누적 후 재판단이 적절."
+    elif tag == "GONE":
+        evidence_text = (
+            "4) 지표 근거: 전년 매출은 있었지만 현재 매출이 0으로 관측되어 집행 중단, 커버리지 상실, 또는 리포트 누락 가능성이 큽니다."
+        )
+        interpretation_text = (
+            "5) 해석: 원인 지표보다 운영 상태 점검이 우선입니다. 대체 캠페인 커버리지와 리마케팅 공백을 먼저 확인해야 합니다."
+        )
+    elif tag == "UNDEFINED":
+        evidence_text = "4) 지표 근거: 핵심 지표 계산에 필요한 분모/로그 조건이 부족해 드라이버를 확정할 수 없습니다."
+        interpretation_text = "5) 해석: 원인 판단 전에 전환 액션 매핑, 집계 기간, 값 이상치 여부를 먼저 점검해야 합니다."
+    else:
+        if driver == "NONE":
+            evidence_text = "4) 지표 근거: 유효한 dlog 신호가 부족해 핵심 지표를 확정할 수 없습니다."
+            interpretation_text = "5) 해석: 지표 신호가 부족해 원인 단정보다 추세 관찰이 우선."
+        else:
+            evidence_text = (
+                f"4) 지표 근거: {driver_label} {_fmt_driver_metric(driver, product_driver_curr)}"
+                f"({_fmt_pct_yoy(driver_yoy)}), BU {driver_label} {_fmt_driver_metric(driver, division_driver_curr)}"
+                f"({_fmt_pct_yoy(division_driver_yoy)}), YoY 격차 {_fmt_pp(driver_gap_pp)}. "
+                f"|dlog| {driver_label} {driver_dlog_abs:.3f} (CVR {dlog_cvr_abs:.3f}, AOV {dlog_aov_abs:.3f}, CPC {dlog_cpc_abs:.3f})"
+            )
+
+            if signal_max_abs < 0.05:
+                interpretation_text = "5) 해석: 지표 신호 강도가 약해 원인 단정보다 추세 관찰이 우선."
+            elif driver == "CPC":
+                if mode_tag == "ISSUE":
+                    interpretation_text = (
+                        "5) 해석: 유입 효율 이슈 신호. 보조 확인은 CTR(IMP/CLICK), 클릭 볼륨, 유입단가 추세."
+                    )
+                else:
+                    interpretation_text = (
+                        "5) 해석: 유입 효율 개선 신호. 보조 확인은 CTR(IMP/CLICK) 유지, 클릭 볼륨 유지 여부."
+                    )
+            elif driver == "CVR":
+                if mode_tag == "ISSUE":
+                    interpretation_text = (
+                        "5) 해석: 전환 효율 이슈 신호. 유입 트래픽 품질(키워드/오디언스/랜딩 정합성) 점검 필요."
+                    )
+                else:
+                    interpretation_text = (
+                        "5) 해석: 전환 효율 개선 신호. 유입 트래픽 품질 개선 및 랜딩/오퍼 적합도 개선 가능성."
+                    )
             else:
-                interpretation_text = (
-                    "5) ???⑤똾留? AOV ??좊즵獒뺣돀??? ??關履?????關履? ???ㅺ강? ???モ섋굢?????룔뀋???좊즵獒뺣돀?????レ챺繹?"
-                )
+                if mode_tag == "ISSUE":
+                    interpretation_text = (
+                        "5) 해석: AOV 이슈는 유입 트래픽 믹스(저의도/저가 상품 유입 비중) 문제 신호."
+                    )
+                else:
+                    interpretation_text = (
+                        "5) 해석: AOV 개선은 고의도/고가 상품 유입 비중 개선 신호."
+                    )
 
     detail = "\n".join([channel_text, division_text, product_text, evidence_text, interpretation_text])
     return headline, detail
@@ -964,7 +995,11 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
     )
     _mark("build_report_rows")
 
+    run_metadata = _build_run_metadata(input_path, current_year=current_year, comparison_meta=comparison_meta)
     summary = {
+        "week_key": run_metadata["week_key"],
+        "generated_at": run_metadata["generated_at"],
+        "source_hash": run_metadata["source_hash"],
         "comparison_meta": comparison_meta,
         "subsidiaries_analyzed": subsidiaries,
         "decomposition_method": {
@@ -1019,6 +1054,11 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
         },
     )
     _mark("save_excel")
+    archive_saved, archive_error_message, archive_dir = _archive_outputs(
+        project_root,
+        week_key=run_metadata["week_key"],
+        output_paths=[output_json_path, output_html_path] + ([output_excel_path] if excel_saved else []),
+    )
     total_elapsed = perf_counter() - pipeline_start
 
     print(
@@ -1037,3 +1077,51 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
         print(f"Saved Excel: {output_excel_path}")
     else:
         print(f"Excel save skipped (file may be open/locked): {excel_error_message}")
+    if archive_saved:
+        print(f"Archived outputs: {archive_dir}")
+    else:
+        print(f"Archive save skipped: {archive_error_message}")
+
+
+
+def _source_hash(path: Path) -> str:
+    digest = hashlib.sha1()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_week_key(current_year: int, comparison_meta: Dict[str, Any]) -> str:
+    month_raw = comparison_meta.get("mtd_month_cutoff") or comparison_meta.get("mtd_month_start")
+    day_raw = comparison_meta.get("mtd_day_cutoff")
+    month = int(month_raw) if month_raw is not None else None
+    day = int(day_raw) if day_raw is not None else None
+    if month is not None and day is not None:
+        return f"{current_year}-{month:02d}-{day:02d}"
+    if month is not None:
+        return f"{current_year}-{month:02d}"
+    return str(current_year)
+
+
+def _build_run_metadata(input_path: Path, current_year: int, comparison_meta: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "week_key": _build_week_key(current_year, comparison_meta),
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_hash": _source_hash(input_path),
+    }
+
+
+def _archive_outputs(project_root: Path, week_key: str, output_paths: List[Path]) -> tuple[bool, str, Path]:
+    archive_dir = project_root / "data" / "archive" / week_key
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for output_path in output_paths:
+            if output_path.exists():
+                shutil.copy2(output_path, archive_dir / output_path.name)
+    except OSError as exc:
+        return False, str(exc), archive_dir
+    return True, "", archive_dir
