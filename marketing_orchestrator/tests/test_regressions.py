@@ -4,6 +4,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +15,7 @@ import polars as pl
 
 from src.application.campaign_action_service import enrich_campaign_actions
 from src.application.report_service import _build_run_metadata, _insight_text
-from src.ingestion import _normalize_wide_engine_frame
+from src.ingestion import _normalize_long_frame, _normalize_wide_engine_frame
 
 
 class WeeklyRoasRegressionTests(unittest.TestCase):
@@ -61,6 +62,44 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         normalized = _normalize_wide_engine_frame(df)
 
         self.assertEqual(normalized.height, 1)
+
+    def test_long_engine_frame_applies_ext_revenue_rules_and_gross_orders(self) -> None:
+        df = pl.DataFrame(
+            {
+                "SUBSIDIARY": ["SEAU", "SEC", "SEAU"],
+                "CHANNEL": ["SEARCH", "SEARCH", "SEARCH"],
+                "DIVISION": ["MX", "MX", "MX"],
+                "PRODUCT": ["S SERIES", "S SERIES", "S SERIES"],
+                "PLATFORM": ["TIKTOK", "GOOGLE", "GOOGLE"],
+                "Year": [2026, 2026, 2026],
+                "PLATFORM_SPEND_USD": ["120.5", "140.0", "90.0"],
+                "PLATFORM_REVENUE_USD": ["450.0", "300.0", "210.0"],
+                "GROSS_REVENUE": ["800.0", "500.0", "999.0"],
+                "PLATFORM_CLICKS": ["80", "100", "50"],
+                "GROSS_ORDERS": ["9", "7", "5"],
+            }
+        )
+
+        normalized = _normalize_long_frame(df)
+
+        self.assertEqual(normalized.height, 3)
+        rows = {(row["SUBSIDIARY"], row["Spend"]): row for row in normalized.to_dicts()}
+
+        tiktok_row = rows[("SEAU", 120.5)]
+        self.assertEqual(tiktok_row["Spend"], 120.5)
+        self.assertEqual(tiktok_row["Revenue"], 800.0)
+        self.assertEqual(tiktok_row["Ext Revenue"], 800.0)
+        self.assertEqual(tiktok_row["Orders"], 9.0)
+
+        sec_row = rows[("SEC", 140.0)]
+        self.assertEqual(sec_row["Revenue"], 500.0)
+        self.assertEqual(sec_row["Ext Revenue"], 500.0)
+        self.assertEqual(sec_row["Orders"], 7.0)
+
+        default_row = rows[("SEAU", 90.0)]
+        self.assertEqual(default_row["Revenue"], 210.0)
+        self.assertEqual(default_row["Ext Revenue"], 210.0)
+        self.assertEqual(default_row["Orders"], 5.0)
 
     def test_insight_text_uses_clean_korean_strings(self) -> None:
         row = {
@@ -149,6 +188,29 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         self.assertEqual(metadata["source_hash"], hashlib.sha1(b"weekly-roas").hexdigest())
         self.assertIn("T", metadata["generated_at"])
 
+    def test_build_run_metadata_uses_metadata_hash_when_file_open_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.xlsx"
+            input_path.write_bytes(b"weekly-roas")
+            stat = input_path.stat()
+            fallback_seed = (
+                f"{input_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{stat.st_ctime_ns}"
+            )
+            expected_hash = hashlib.sha1(fallback_seed.encode("utf-8", errors="replace")).hexdigest()
+
+            with patch("pathlib.Path.open", side_effect=PermissionError("locked")):
+                metadata = _build_run_metadata(
+                    input_path,
+                    current_year=2026,
+                    comparison_meta={"mtd_month_cutoff": 2, "mtd_day_cutoff": 20},
+                )
+
+        self.assertEqual(metadata["week_key"], "2026-02-20")
+        self.assertEqual(metadata["source_hash"], expected_hash)
+        self.assertIn("T", metadata["generated_at"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

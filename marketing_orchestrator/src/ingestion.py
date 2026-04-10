@@ -14,7 +14,7 @@ import polars as pl
 DIMENSIONS: list[str] = ["SUBSIDIARY", "CHANNEL", "DIVISION", "PRODUCT"]
 RAW_METRIC_MAP: dict[str, str] = {
     "PLATFORM_SPEND_USD": "Spend",
-    "GROSS_REVENUE": "Revenue",
+    "PLATFORM_REVENUE_USD": "Revenue",
     "PLATFORM_CLICKS": "Clicks",
     "GROSS_ORDERS": "Orders",
 }
@@ -112,7 +112,7 @@ REQUIRED_LONG_HEADERS_UPPER: set[str] = {
     "PLATFORM_SPEND_USD",
     "PLATFORM_CLICKS",
     "GROSS_ORDERS",
-    "GROSS_REVENUE",
+    "PLATFORM_REVENUE_USD",
 }
 REQUIRED_WIDE_HEADERS_UPPER: set[str] = {column.upper() for column in ENGINE_COLUMNS}
 DEFAULT_CURR_YEAR = date.today().year
@@ -335,6 +335,19 @@ def _read_with_openpyxl(path: Path, target_sheet: str, preferred_sheet: str) -> 
     return _standardize_known_columns(pl.DataFrame(records))
 
 
+def _read_raw_input_excel_frame(path: Path, preferred_sheet: str = "raw") -> pl.DataFrame:
+    excel_path = Path(path)
+    if not excel_path.exists():
+        raise FileNotFoundError(f"Input Excel file not found: {excel_path}")
+
+    try:
+        raw_df = _read_with_polars(excel_path, preferred_sheet, preferred_sheet)
+    except Exception:
+        target_sheet = _select_sheet_name(excel_path, preferred_sheet)
+        raw_df = _read_with_openpyxl(excel_path, target_sheet, preferred_sheet)
+    return _standardize_known_columns(raw_df)
+
+
 def _year_expr(column_name: str) -> pl.Expr:
     return pl.coalesce(
         [
@@ -419,6 +432,46 @@ def _dimension_expr(column_name: str) -> pl.Expr:
         .fill_null("UNKNOWN")
         .alias(column_name)
     )
+
+
+def _normalized_text_expr(column_name: str) -> pl.Expr:
+    return pl.col(column_name).cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase()
+
+
+def _ext_revenue_source_expr(columns: Sequence[str]) -> pl.Expr:
+    base_revenue = _metric_parsed_expr("Revenue").fill_null(0.0)
+    if "GROSS_REVENUE" not in columns:
+        return base_revenue.alias("Ext Revenue")
+
+    gross_revenue = _metric_parsed_expr("GROSS_REVENUE").fill_null(0.0)
+    use_sec_revenue = (_normalized_text_expr("SUBSIDIARY") == pl.lit("SEC")).fill_null(False)
+    if "PLATFORM" in columns:
+        use_tiktok_revenue = _normalized_text_expr("PLATFORM").str.contains("TIKTOK").fill_null(False)
+    else:
+        use_tiktok_revenue = pl.lit(False)
+    return pl.when(use_sec_revenue | use_tiktok_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
+
+
+def _raw_ext_revenue_expr(columns: Sequence[str]) -> pl.Expr:
+    base_column = "PLATFORM_REVENUE_USD" if "PLATFORM_REVENUE_USD" in columns else "Revenue"
+    if base_column in columns:
+        base_revenue = _metric_parsed_expr(base_column).fill_null(0.0)
+    else:
+        base_revenue = pl.lit(0.0)
+
+    if "GROSS_REVENUE" not in columns:
+        return base_revenue.alias("Ext Revenue")
+
+    gross_revenue = _metric_parsed_expr("GROSS_REVENUE").fill_null(0.0)
+    if "SUBSIDIARY" in columns:
+        use_sec_revenue = (_normalized_text_expr("SUBSIDIARY") == pl.lit("SEC")).fill_null(False)
+    else:
+        use_sec_revenue = pl.lit(False)
+    if "PLATFORM" in columns:
+        use_tiktok_revenue = _normalized_text_expr("PLATFORM").str.contains("TIKTOK").fill_null(False)
+    else:
+        use_tiktok_revenue = pl.lit(False)
+    return pl.when(use_sec_revenue | use_tiktok_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
 
 
 def _empty_engine_frame() -> pl.DataFrame:
@@ -516,21 +569,28 @@ def _normalize_long_frame(df: pl.DataFrame) -> pl.DataFrame:
 
     renamed = df.rename(RAW_METRIC_MAP)
     selected_columns = [*DIMENSIONS, year_column, *METRICS]
+    if "GROSS_REVENUE" in renamed.columns:
+        selected_columns.append("GROSS_REVENUE")
+    if "PLATFORM" in renamed.columns:
+        selected_columns.append("PLATFORM")
     if month_column is not None:
         selected_columns.append(month_column)
     if day_column is not None:
         selected_columns.append(day_column)
 
     selected = renamed.select(selected_columns)
+    metric_quality_columns = list(METRICS)
+    if "GROSS_REVENUE" in selected.columns:
+        metric_quality_columns.append("GROSS_REVENUE")
     _validate_metric_parse_errors(
         selected,
-        metric_columns=METRICS,
+        metric_columns=metric_quality_columns,
         context="long_engine_frame",
     )
 
     exprs = (
         [_dimension_expr(dim) for dim in DIMENSIONS]
-        + [_metric_expr(metric) for metric in METRICS]
+        + [_metric_expr("Spend"), _metric_expr("Clicks"), _metric_expr("Orders"), _ext_revenue_source_expr(selected.columns)]
         + [_year_expr(year_column).alias("Year")]
     )
 
@@ -542,8 +602,8 @@ def _normalize_long_frame(df: pl.DataFrame) -> pl.DataFrame:
         exprs.append(_int_expr(day_column).alias("Day"))
         output_columns.append("Day")
 
-    normalized = selected.with_columns(exprs)
-    output_columns.extend(METRICS)
+    normalized = selected.with_columns(exprs).with_columns(pl.col("Ext Revenue").alias("Revenue"))
+    output_columns.extend([*METRICS, "Ext Revenue"])
     return normalized.select(output_columns)
 
 
@@ -650,6 +710,138 @@ def _to_engine_frame(
     return _pivot_long_to_engine(filtered_df, curr_year=curr_year, prev_year=prev_year), meta
 
 
+def _filter_raw_frame_for_html_window(
+    df: pl.DataFrame,
+    curr_year: int,
+    prev_year: int,
+    mtd_only: bool,
+) -> tuple[pl.DataFrame, Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "curr_year": curr_year,
+        "prev_year": prev_year,
+        "mtd_applied": False,
+    }
+    year_column = "Year" if "Year" in df.columns else "YEAR" if "YEAR" in df.columns else None
+    if year_column is None:
+        return df, meta
+
+    scoped = df.with_columns(_year_expr(year_column).alias("__calc_year")).filter(pl.col("__calc_year").is_in([curr_year, prev_year]))
+    if not mtd_only:
+        return scoped.drop("__calc_year"), meta
+
+    month_column = "Month" if "Month" in scoped.columns else "MONTH" if "MONTH" in scoped.columns else None
+    if month_column is None:
+        return scoped.drop("__calc_year"), meta
+
+    scoped = scoped.with_columns(_int_expr(month_column).alias("__calc_month"))
+    curr_scope = scoped.filter(pl.col("__calc_year") == curr_year)
+    if curr_scope.is_empty():
+        drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
+        return scoped.drop(*drop_columns), meta
+
+    max_month = curr_scope.select(pl.col("__calc_month").max()).to_series(0)[0]
+    if max_month is None:
+        drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
+        return scoped.drop(*drop_columns), meta
+
+    meta["mtd_month_start"] = int(max_month)
+    meta["mtd_month_cutoff"] = int(max_month)
+
+    day_column = "Day" if "Day" in scoped.columns else "DAY" if "DAY" in scoped.columns else None
+    max_day = None
+    if day_column is not None:
+        scoped = scoped.with_columns(_int_expr(day_column).alias("__calc_day"))
+        max_day = (
+            curr_scope.with_columns(_int_expr(day_column).alias("__calc_day"))
+            .filter(pl.col("__calc_month") == pl.lit(max_month))
+            .select(pl.col("__calc_day").max())
+            .to_series(0)[0]
+        )
+        if max_day is not None:
+            meta["mtd_day_start"] = 1
+            meta["mtd_day_cutoff"] = int(max_day)
+
+    if day_column is not None and max_day is not None:
+        in_window = (
+            (pl.col("__calc_month") == pl.lit(max_month))
+            & (pl.col("__calc_day") >= pl.lit(1))
+            & (pl.col("__calc_day") <= pl.lit(max_day))
+        )
+    else:
+        in_window = pl.col("__calc_month") == pl.lit(max_month)
+
+    filtered = scoped.filter(in_window)
+    meta["mtd_applied"] = True
+    drop_columns = [column for column in ["__calc_year", "__calc_month", "__calc_day"] if column in filtered.columns]
+    return filtered.drop(*drop_columns), meta
+
+
+def build_html_calc_raw_sheets(
+    path: str | Path,
+    curr_year: int = DEFAULT_CURR_YEAR,
+    prev_year: int = DEFAULT_PREV_YEAR,
+    preferred_sheet: str = "raw",
+    mtd_only: bool = True,
+) -> tuple[Dict[str, pl.DataFrame], Dict[str, Any]]:
+    raw_df = _read_raw_input_excel_frame(path, preferred_sheet=preferred_sheet)
+    filtered_objective_df, objective_meta = _filter_conversion_objective(raw_df)
+    scoped_df, division_meta = _filter_target_divisions(filtered_objective_df)
+
+    if set(ENGINE_COLUMNS).issubset(scoped_df.columns):
+        normalized_df = _normalize_wide_engine_frame(scoped_df)
+        engine_df = normalized_df
+        long_meta: Dict[str, Any] = {
+            "curr_year": curr_year,
+            "prev_year": prev_year,
+            "mtd_applied": False,
+            "source_format": "wide",
+        }
+    else:
+        long_df = _normalize_long_frame(scoped_df)
+        if mtd_only:
+            normalized_df, long_meta = _apply_mtd_alignment(long_df, curr_year=curr_year, prev_year=prev_year)
+        else:
+            normalized_df = _filter_target_years(long_df, curr_year=curr_year, prev_year=prev_year)
+            long_meta = {"curr_year": curr_year, "prev_year": prev_year, "mtd_applied": False}
+        long_meta["source_format"] = "long"
+        engine_df = _pivot_long_to_engine(normalized_df, curr_year=curr_year, prev_year=prev_year)
+
+    raw_full_df, raw_full_meta = _filter_raw_frame_for_html_window(
+        scoped_df,
+        curr_year=curr_year,
+        prev_year=prev_year,
+        mtd_only=mtd_only,
+    )
+    raw_full_df = raw_full_df.with_columns(_raw_ext_revenue_expr(raw_full_df.columns))
+
+    merged_meta: Dict[str, Any] = {"curr_year": curr_year, "prev_year": prev_year}
+    merged_meta.update(objective_meta)
+    merged_meta.update(division_meta)
+    merged_meta.update(long_meta)
+    merged_meta.update(raw_full_meta)
+    merged_meta["raw_rows_input"] = int(raw_df.height)
+    merged_meta["raw_rows_objective_filtered"] = int(filtered_objective_df.height)
+    merged_meta["raw_rows_division_filtered"] = int(scoped_df.height)
+    merged_meta["raw_rows_mtd_html_calc"] = int(normalized_df.height)
+    merged_meta["raw_rows_mtd_html_calc_full"] = int(raw_full_df.height)
+    merged_meta["engine_rows_html_calc"] = int(engine_df.height)
+    merged_meta["input_path"] = str(Path(path).expanduser().resolve())
+
+    meta_df = pl.DataFrame(
+        {
+            "key": list(merged_meta.keys()),
+            "value": [json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v) for v in merged_meta.values()],
+        }
+    )
+    sheets = {
+        "raw_mtd_html_calc_full": raw_full_df,
+        "raw_mtd_html_calc": normalized_df,
+        "engine_html_input": engine_df,
+        "meta": meta_df,
+    }
+    return sheets, merged_meta
+
+
 def read_input_excel(
     path: str | Path,
     preferred_sheet: str = "raw",
@@ -659,15 +851,7 @@ def read_input_excel(
     return_meta: bool = False,
 ) -> pl.DataFrame | tuple[pl.DataFrame, Dict[str, Any]]:
     """Read input Excel and return engine-ready wide schema with curr/prev metrics."""
-    excel_path = Path(path)
-    if not excel_path.exists():
-        raise FileNotFoundError(f"Input Excel file not found: {excel_path}")
-
-    try:
-        raw_df = _read_with_polars(excel_path, preferred_sheet, preferred_sheet)
-    except Exception:
-        target_sheet = _select_sheet_name(excel_path, preferred_sheet)
-        raw_df = _read_with_openpyxl(excel_path, target_sheet, preferred_sheet)
+    raw_df = _read_raw_input_excel_frame(path, preferred_sheet=preferred_sheet)
 
     engine_df, meta = _to_engine_frame(
         raw_df,

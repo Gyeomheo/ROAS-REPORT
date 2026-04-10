@@ -17,7 +17,11 @@ from src.application.reporting import lmdi as reporting_lmdi
 from src.application.reporting import metrics as reporting_metrics
 from src.application.reporting import rendering as reporting_rendering
 from src.application.reporting import selectors as reporting_selectors
-from src.infrastructure.excel_repository import load_input_frame, save_output_workbook
+from src.infrastructure.excel_repository import (
+    load_input_frame,
+    save_html_calc_raw_workbook,
+    save_output_workbook,
+)
 from src.infrastructure.report_exporter import save_summary_html, save_summary_json
 
 
@@ -954,7 +958,11 @@ def _flatten_trace(drill_trace: Dict[str, Any]) -> pl.DataFrame:
     return pl.DataFrame(rows).select(columns)
 
 
-def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None = None) -> None:
+def run_reporting_pipeline(
+    input_path: str | Path,
+    curr_year: int | None = None,
+    prev_year: int | None = None,
+) -> None:
     pipeline_start = perf_counter()
     stage_start = pipeline_start
     stage_timings: list[tuple[str, float]] = []
@@ -967,12 +975,18 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
         stage_start = now
 
     project_root = Path(__file__).resolve().parents[2]
-    input_path = project_root / "data" / "raw" / "input.xlsx"
+    input_path = Path(input_path).expanduser().resolve()
     output_json_path = project_root / "output" / "summary.json"
     output_excel_path = project_root / "output" / "summary.xlsx"
+    output_raw_calc_excel_path = project_root / "output" / "raw_html_mtd_conversion_extrevenue.xlsx"
     output_html_path = project_root / "output" / "summary.html"
 
-    df, comparison_meta = load_input_frame(input_path, curr_year=current_year, prev_year=previous_year)
+    df, comparison_meta = load_input_frame(
+        input_path,
+        curr_year=current_year,
+        prev_year=previous_year,
+        cache_root=project_root,
+    )
     _mark("load_input_frame")
     analysis = run_subsidiary_analysis(df, dimensions=DIMENSIONS)
     _mark("run_subsidiary_analysis")
@@ -1053,11 +1067,19 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
             "trace": trace_df,
         },
     )
+    raw_calc_saved, raw_calc_error_message, raw_calc_meta, raw_calc_saved_path = save_html_calc_raw_workbook(
+        output_raw_calc_excel_path,
+        input_path=input_path,
+        curr_year=current_year,
+        prev_year=previous_year,
+    )
     _mark("save_excel")
     archive_saved, archive_error_message, archive_dir = _archive_outputs(
         project_root,
         week_key=run_metadata["week_key"],
-        output_paths=[output_json_path, output_html_path] + ([output_excel_path] if excel_saved else []),
+        output_paths=[output_json_path, output_html_path]
+        + ([output_excel_path] if excel_saved else [])
+        + ([raw_calc_saved_path] if raw_calc_saved else []),
     )
     total_elapsed = perf_counter() - pipeline_start
 
@@ -1077,6 +1099,17 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
         print(f"Saved Excel: {output_excel_path}")
     else:
         print(f"Excel save skipped (file may be open/locked): {excel_error_message}")
+    if raw_calc_saved:
+        print(
+            "Saved Calc RAW Excel: "
+            f"{raw_calc_saved_path} "
+            f"(rows_full={raw_calc_meta.get('raw_rows_mtd_html_calc_full', 0)}, "
+            f"rows_engine={raw_calc_meta.get('engine_rows_html_calc', 0)})"
+        )
+        if raw_calc_error_message:
+            print(f"Calc RAW Excel note: {raw_calc_error_message}")
+    else:
+        print(f"Calc RAW Excel save skipped: {raw_calc_error_message}")
     if archive_saved:
         print(f"Archived outputs: {archive_dir}")
     else:
@@ -1086,13 +1119,27 @@ def run_reporting_pipeline(curr_year: int | None = None, prev_year: int | None =
 
 def _source_hash(path: Path) -> str:
     digest = hashlib.sha1()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    try:
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except PermissionError:
+        # OneDrive/Excel can keep a transient lock on the workbook.
+        return _source_metadata_hash(path)
+
+
+def _source_metadata_hash(path: Path) -> str:
+    resolved = path.expanduser().resolve()
+    try:
+        stat = resolved.stat()
+        fingerprint = f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}|{stat.st_ctime_ns}"
+    except OSError:
+        fingerprint = str(resolved)
+    return hashlib.sha1(fingerprint.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _build_week_key(current_year: int, comparison_meta: Dict[str, Any]) -> str:
@@ -1125,3 +1172,4 @@ def _archive_outputs(project_root: Path, week_key: str, output_paths: List[Path]
     except OSError as exc:
         return False, str(exc), archive_dir
     return True, "", archive_dir
+

@@ -4,27 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
-from src.ingestion import read_input_excel, write_output_excel
+from src.ingestion import build_html_calc_raw_sheets, read_input_excel, write_output_excel
 
 CACHE_SCHEMA_VERSION = 1
 CACHE_MTD_ONLY = True
 CACHE_PREFERRED_SHEET = "raw"
 
 
-def _project_root_from_input(path: Path) -> Path:
-    resolved = path.resolve()
-    if len(resolved.parents) >= 3:
-        return resolved.parents[2]
-    return resolved.parent
-
-
-def _cache_paths(path: Path) -> tuple[Path, Path]:
-    project_root = _project_root_from_input(path)
+def _cache_paths(path: Path, cache_root: Path) -> tuple[Path, Path]:
+    project_root = cache_root.resolve()
     cache_dir = project_root / "output" / ".cache"
     path_hash = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
     return (
@@ -89,9 +83,15 @@ def _save_cache(
         return
 
 
-def load_input_frame(path: Path, curr_year: int, prev_year: int) -> tuple[pl.DataFrame, dict[str, Any]]:
+def load_input_frame(
+    path: Path,
+    curr_year: int,
+    prev_year: int,
+    cache_root: Path,
+) -> tuple[pl.DataFrame, dict[str, Any]]:
     key = _cache_key(path, curr_year=curr_year, prev_year=prev_year)
-    frame_cache_path, meta_cache_path = _cache_paths(path)
+    project_root = cache_root.resolve()
+    frame_cache_path, meta_cache_path = _cache_paths(path, cache_root=project_root)
     cached = _load_cache(frame_cache_path, meta_cache_path, key)
     if cached is not None:
         cached_frame, cached_meta = cached
@@ -130,3 +130,32 @@ def save_output_workbook(path: Path, sheets: dict[str, pl.DataFrame]) -> tuple[b
     except PermissionError as exc:
         return False, str(exc)
     return True, ""
+
+
+def save_html_calc_raw_workbook(
+    path: Path,
+    input_path: Path,
+    curr_year: int,
+    prev_year: int,
+) -> tuple[bool, str, dict[str, Any], Path]:
+    sheets: dict[str, pl.DataFrame] = {}
+    meta: dict[str, Any] = {}
+    try:
+        sheets, meta = build_html_calc_raw_sheets(
+            input_path,
+            curr_year=curr_year,
+            prev_year=prev_year,
+            preferred_sheet=CACHE_PREFERRED_SHEET,
+            mtd_only=CACHE_MTD_ONLY,
+        )
+        write_output_excel(path, sheets)
+        return True, "", meta, path
+    except PermissionError as exc:
+        fallback_path = path.with_name(f"{path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+        try:
+            write_output_excel(fallback_path, sheets)
+        except Exception as fallback_exc:
+            return False, f"{exc}; fallback failed: {fallback_exc}", {}, path
+        return True, f"{exc}; saved to fallback path", meta, fallback_path
+    except Exception as exc:
+        return False, str(exc), {}, path

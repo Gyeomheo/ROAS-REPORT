@@ -78,6 +78,17 @@ def _fmt_cvr(value: float | None) -> str:
     return f"{value * 100:.2f}%"
 
 
+def _fmt_excel_number(value: float | None, decimals: int = 6) -> str:
+    if value is None:
+        return ""
+    text = f"{float(value):.{decimals}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text == "-0":
+        return "0"
+    return text
+
+
 def _sum_aggs() -> list[pl.Expr]:
     return [
         pl.col("Revenue_curr").sum().alias("Revenue_curr_sum"),
@@ -392,7 +403,7 @@ def _yoy_css_class(metric_name: str, value: float | None) -> str:
 
 def _render_yoy_cell(metric_name: str, value: float | None) -> str:
     css = _yoy_css_class(metric_name, value)
-    return f"<td class=\"{css}\">{escape(_fmt_pct(value))}</td>"
+    return f"<td class=\"{css}\">{escape(_fmt_excel_number(value, decimals=6))}</td>"
 
 
 def _render_metric_table(metrics: Dict[str, Any]) -> str:
@@ -400,16 +411,16 @@ def _render_metric_table(metrics: Dict[str, Any]) -> str:
         "<table class=\"metric-table\">"
         "<thead><tr><th>Year</th><th>Cost</th><th>Revenue</th><th>ROAS</th><th>CPC</th><th>CVR</th></tr></thead>"
         "<tbody>"
-        f"<tr><td>2026</td><td>{escape(_fmt_money(metrics.get('cost_curr')))}</td>"
-        f"<td>{escape(_fmt_money(metrics.get('revenue_curr')))}</td>"
-        f"<td>{escape(_fmt_roas(metrics.get('roas_curr')))}</td>"
-        f"<td>{escape(_fmt_cpc(metrics.get('cpc_curr')))}</td>"
-        f"<td>{escape(_fmt_cvr(metrics.get('cvr_curr')))}</td></tr>"
-        f"<tr><td>2025</td><td>{escape(_fmt_money(metrics.get('cost_prev')))}</td>"
-        f"<td>{escape(_fmt_money(metrics.get('revenue_prev')))}</td>"
-        f"<td>{escape(_fmt_roas(metrics.get('roas_prev')))}</td>"
-        f"<td>{escape(_fmt_cpc(metrics.get('cpc_prev')))}</td>"
-        f"<td>{escape(_fmt_cvr(metrics.get('cvr_prev')))}</td></tr>"
+        f"<tr><td>2026</td><td>{escape(_fmt_excel_number(metrics.get('cost_curr'), decimals=2))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('revenue_curr'), decimals=2))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('roas_curr'), decimals=6))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('cpc_curr'), decimals=6))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('cvr_curr'), decimals=6))}</td></tr>"
+        f"<tr><td>2025</td><td>{escape(_fmt_excel_number(metrics.get('cost_prev'), decimals=2))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('revenue_prev'), decimals=2))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('roas_prev'), decimals=6))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('cpc_prev'), decimals=6))}</td>"
+        f"<td>{escape(_fmt_excel_number(metrics.get('cvr_prev'), decimals=6))}</td></tr>"
         "<tr class=\"yoy\"><td>YoY</td>"
         f"{_render_yoy_cell('cost', metrics.get('cost_yoy'))}"
         f"{_render_yoy_cell('revenue', metrics.get('revenue_yoy'))}"
@@ -829,10 +840,19 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
     mtd_month_cutoff = int(comparison_meta.get("mtd_month_cutoff", 0) or 0)
     mtd_day_start = int(comparison_meta.get("mtd_day_start", 0) or 0)
     mtd_day_cutoff = int(comparison_meta.get("mtd_day_cutoff", 0) or 0)
-    if mtd_applied and curr_year and prev_year and mtd_month_start and mtd_month_cutoff and mtd_day_start and mtd_day_cutoff:
-        curr_mtd = f"{int(curr_year):04d}-{mtd_month_start:02d}-{mtd_day_start:02d} ~ {int(curr_year):04d}-{mtd_month_cutoff:02d}-{mtd_day_cutoff:02d}"
-        prev_mtd = f"{int(prev_year):04d}-{mtd_month_start:02d}-{mtd_day_start:02d} ~ {int(prev_year):04d}-{mtd_month_cutoff:02d}-{mtd_day_cutoff:02d}"
-        mtd_meta_text = f"MTD range: {curr_mtd} (YoY window: {prev_mtd})"
+    if mtd_applied and curr_year and prev_year and mtd_month_start and mtd_month_cutoff:
+        if mtd_day_start and mtd_day_cutoff:
+            curr_mtd = f"{int(curr_year):04d}-{mtd_month_start:02d}-{mtd_day_start:02d} ~ {int(curr_year):04d}-{mtd_month_cutoff:02d}-{mtd_day_cutoff:02d}"
+            prev_mtd = f"{int(prev_year):04d}-{mtd_month_start:02d}-{mtd_day_start:02d} ~ {int(prev_year):04d}-{mtd_month_cutoff:02d}-{mtd_day_cutoff:02d}"
+            mtd_meta_text = f"MTD range: {curr_mtd} (YoY window: {prev_mtd})"
+        else:
+            if mtd_month_start == mtd_month_cutoff:
+                curr_mtd = f"{int(curr_year):04d}-{mtd_month_start:02d}"
+                prev_mtd = f"{int(prev_year):04d}-{mtd_month_start:02d}"
+            else:
+                curr_mtd = f"{int(curr_year):04d}-{mtd_month_start:02d} ~ {int(curr_year):04d}-{mtd_month_cutoff:02d}"
+                prev_mtd = f"{int(prev_year):04d}-{mtd_month_start:02d} ~ {int(prev_year):04d}-{mtd_month_cutoff:02d}"
+            mtd_meta_text = f"MTD range: {curr_mtd} (YoY month-window: {prev_mtd})"
     else:
         mtd_meta_text = "MTD range: not applied"
     division_applied = bool(comparison_meta.get("division_filter_applied", False))
@@ -1017,3 +1037,4 @@ def write_html_report(output_path: Path, summary: Dict[str, Any], df: pl.DataFra
 """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
+
