@@ -734,8 +734,315 @@ def _build_subsidiary_reports(
                 "performance": perf,
                 "top3": selected_top3,
             }
-        )
+    )
     return reports
+
+
+def _topic_scope(row: Dict[str, Any]) -> tuple[str, str, str]:
+    path = row.get("path", {})
+    if not isinstance(path, dict):
+        path = {}
+    channel = str(path.get("CHANNEL", "") or "")
+    division = str(path.get("DIVISION", "") or "")
+    product = str(path.get("PRODUCT", "") or "")
+    return channel, division, product
+
+
+def _topic_root_cause_text(row: Dict[str, Any]) -> str:
+    driver = str(row.get("primary_driver", "NONE") or "NONE").upper()
+    tag = str(row.get("tag", "") or "").upper()
+
+    if tag == "NEW":
+        return "신규 토픽(NEW): 전년 기준이 부족해 원인 확정보다 초기 추세 모니터링이 우선."
+    if tag == "LOW_VOL":
+        return "저볼륨(LOW_VOL): 표본이 작아 변동성이 커 드라이버 해석 신뢰도에 주의 필요."
+    if tag == "GONE":
+        return "종료(GONE): 전년 매출은 있으나 현재 매출 0으로 집행중단/커버리지 공백 여부 점검 필요."
+    if tag == "UNDEFINED":
+        return "미정의(UNDEFINED): 분모/로그 조건 부족으로 드라이버 확정이 어려워 데이터 품질 점검 우선."
+
+    if driver == "CVR":
+        curr_key, prev_key, dlog_key = "CVR_curr", "CVR_prev", "dlog_CVR"
+    elif driver == "AOV":
+        curr_key, prev_key, dlog_key = "AOV_curr", "AOV_prev", "dlog_AOV"
+    elif driver == "CPC":
+        curr_key, prev_key, dlog_key = "CPC_curr", "CPC_prev", "dlog_CPC"
+    else:
+        return "핵심 지표 미확정(NONE): dlog 신호가 약해 원인 단정보다 추세 관찰이 우선."
+
+    curr = row.get(curr_key)
+    prev = row.get(prev_key)
+    yoy = _safe_pct_change(curr, prev)
+    dlog_raw = row.get(dlog_key)
+    dlog_text = "N/A" if dlog_raw is None else f"{_to_float(dlog_raw):.3f}"
+
+    why_selected = str(row.get("why_selected_text", "") or "").strip()
+    detail = f"{driver} 기반 원인. YoY {_fmt_pct_yoy(yoy)}, dlog {dlog_text}."
+    if why_selected:
+        detail = f"{detail} 선정근거: {why_selected}"
+    return detail
+
+
+def _subsidiary_issue_action_sheet_df(
+    subsidiary: str,
+    rows: List[Dict[str, Any]],
+    source_label: str,
+) -> pl.DataFrame:
+    columns = [
+        "Subsidiary",
+        "Rank",
+        "Media",
+        "BU",
+        "Product",
+        "Issue Finding",
+        "Root Cause Analysis",
+        "Action Item",
+        "Checklist",
+        "Primary Driver",
+        "Tag",
+        "Contribution",
+        "Source",
+    ]
+    if not rows:
+        return pl.DataFrame({col: [] for col in columns})
+
+    out: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        channel, division, product = _topic_scope(row)
+        issue_finding = str(row.get("summary_text", "") or row.get("why_selected_text", "") or "").strip()
+        root_cause = _topic_root_cause_text(row)
+        action_item = str(row.get("recommended_actions", "") or "").strip()
+        checklist = str(row.get("action_checklist", "") or "").strip()
+        out.append(
+            {
+                "Subsidiary": subsidiary,
+                "Rank": idx,
+                "Media": channel,
+                "BU": division,
+                "Product": product,
+                "Issue Finding": issue_finding,
+                "Root Cause Analysis": root_cause,
+                "Action Item": action_item,
+                "Checklist": checklist,
+                "Primary Driver": str(row.get("primary_driver", "NONE") or "NONE"),
+                "Tag": str(row.get("tag", "") or ""),
+                "Contribution": str(row.get("impact_contribution_text", "N/A") or "N/A"),
+                "Source": source_label,
+            }
+        )
+    return pl.DataFrame(out).select(columns)
+
+
+def _build_subsidiary_issue_action_sheets(
+    subsidiaries: List[str],
+    subsidiary_reports: List[Dict[str, Any]],
+    issues_top3_by_sub: Dict[str, List[Dict[str, Any]]],
+    improvements_top3_by_sub: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, pl.DataFrame]:
+    report_map: Dict[str, Dict[str, Any]] = {}
+    for report in subsidiary_reports:
+        if not isinstance(report, dict):
+            continue
+        sub = str(report.get("SUBSIDIARY", "") or "")
+        if sub:
+            report_map[sub] = report
+
+    sheet_map: Dict[str, pl.DataFrame] = {}
+    for sub in subsidiaries:
+        issue_rows = issues_top3_by_sub.get(sub, [])
+        if issue_rows:
+            selected_rows = issue_rows
+            source_label = "issues_top3_products_by_subsidiary"
+        else:
+            report_top3 = []
+            report = report_map.get(sub, {})
+            if isinstance(report, dict):
+                maybe_top3 = report.get("top3", [])
+                if isinstance(maybe_top3, list):
+                    report_top3 = [row for row in maybe_top3 if isinstance(row, dict)]
+            if report_top3:
+                selected_rows = report_top3
+                source_label = "subsidiary_reports.top3"
+            else:
+                improve_rows = improvements_top3_by_sub.get(sub, [])
+                selected_rows = improve_rows
+                source_label = "improvements_top3_products_by_subsidiary"
+
+        # Excel sheet names are max 31 chars.
+        sheet_name = str(sub)[:31] if sub else "UNKNOWN"
+        sheet_map[sheet_name] = _subsidiary_issue_action_sheet_df(sub, selected_rows, source_label)
+    return sheet_map
+
+
+def _template_topics_for_sub(
+    subsidiary: str,
+    issues_top3_by_sub: Dict[str, List[Dict[str, Any]]],
+    improvements_top3_by_sub: Dict[str, List[Dict[str, Any]]],
+    report_map: Dict[str, Dict[str, Any]],
+    preferred_mode: str,
+) -> List[Dict[str, Any]]:
+    mode = str(preferred_mode or "ISSUE").upper()
+    issue_rows = issues_top3_by_sub.get(subsidiary, [])[:3]
+    improve_rows = improvements_top3_by_sub.get(subsidiary, [])[:3]
+    if mode == "IMPROVE":
+        if improve_rows:
+            return improve_rows
+    else:
+        if issue_rows:
+            return issue_rows
+
+    report = report_map.get(subsidiary, {})
+    if isinstance(report, dict):
+        top3 = report.get("top3", [])
+        if isinstance(top3, list) and top3:
+            return [row for row in top3 if isinstance(row, dict)][:3]
+
+    return issue_rows if issue_rows else improve_rows
+
+
+def _template_issue_text(row: Dict[str, Any]) -> str:
+    channel, division, product = _topic_scope(row)
+    summary = str(row.get("summary_text", "") or row.get("why_selected_text", "") or "").strip()
+    root_cause = _topic_root_cause_text(row)
+    prefix = "/".join([token for token in [channel, division, product] if token])
+    parts = []
+    if prefix:
+        parts.append(prefix)
+    if summary:
+        parts.append(summary)
+    if root_cause:
+        parts.append(f"원인분석: {root_cause}")
+    return " | ".join(parts)
+
+
+def _template_action_text(row: Dict[str, Any]) -> str:
+    action = str(row.get("recommended_actions", "") or "").strip()
+    checklist = str(row.get("action_checklist", "") or "").strip()
+    if action and checklist:
+        return f"{action} | {checklist}"
+    if action:
+        return action
+    if checklist:
+        return checklist
+    return "액션 없음"
+
+
+def _save_reff_format_workbook(
+    project_root: Path,
+    subsidiaries: List[str],
+    subsidiary_reports: List[Dict[str, Any]],
+    issues_top3_by_sub: Dict[str, List[Dict[str, Any]]],
+    improvements_top3_by_sub: Dict[str, List[Dict[str, Any]]],
+    comparison_meta: Dict[str, Any],
+) -> tuple[bool, str, Path]:
+    template_path = project_root.parent / "Reff" / "ROAS Report Format.xlsx"
+    output_path = project_root / "output" / "ROAS Report Format_filled.xlsx"
+    if not template_path.exists():
+        return False, f"Template not found: {template_path}", output_path
+
+    try:
+        from openpyxl import load_workbook
+    except Exception as exc:  # pragma: no cover
+        return False, f"openpyxl import failed: {exc}", output_path
+
+    report_map: Dict[str, Dict[str, Any]] = {}
+    for report in subsidiary_reports:
+        if not isinstance(report, dict):
+            continue
+        sub = str(report.get("SUBSIDIARY", "") or "")
+        if sub:
+            report_map[sub] = report
+
+    curr_year = int(comparison_meta.get("curr_year", date.today().year))
+    prev_year = int(comparison_meta.get("prev_year", curr_year - 1))
+    mtd_month = comparison_meta.get("mtd_month_cutoff") or comparison_meta.get("mtd_month_start")
+    mtd_day = comparison_meta.get("mtd_day_cutoff")
+    if mtd_month and mtd_day:
+        period_text = f"({curr_year} MTD 1/1 - {int(mtd_month)}/{int(mtd_day)})"
+    elif mtd_month:
+        period_text = f"({curr_year} MTD month {int(mtd_month)})"
+    else:
+        period_text = f"({curr_year} vs {prev_year})"
+    source_line = f"* Source: GMPD RAW, LMDI pipeline, {prev_year} & {curr_year} {period_text}"
+    method_line = "** Data Source: Impact(LMDI) + RCA(CVR/AOV/CPC) + rule-based action recommendation"
+
+    try:
+        workbook = load_workbook(template_path)
+        for sub in subsidiaries:
+            if sub not in workbook.sheetnames:
+                continue
+            worksheet = workbook[sub]
+            report = report_map.get(sub, {})
+            mode = str(report.get("mode", "ISSUE") if isinstance(report, dict) else "ISSUE").upper()
+            rows = _template_topics_for_sub(
+                sub,
+                issues_top3_by_sub=issues_top3_by_sub,
+                improvements_top3_by_sub=improvements_top3_by_sub,
+                report_map=report_map,
+                preferred_mode=mode,
+            )
+
+            worksheet.cell(row=2, column=2).value = source_line
+            worksheet.cell(row=3, column=2).value = method_line
+
+            issue_texts = [_template_issue_text(row) for row in rows[:3]]
+            action_texts = [_template_action_text(row) for row in rows[:3]]
+
+            for idx in range(3):
+                issue_row = 8 + idx
+                action_row = 15 + idx
+                worksheet.cell(row=issue_row, column=3).value = issue_texts[idx] if idx < len(issue_texts) else None
+                worksheet.cell(row=action_row, column=3).value = action_texts[idx] if idx < len(action_texts) else None
+
+        if "Sheet1" in workbook.sheetnames:
+            sheet1 = workbook["Sheet1"]
+            for row_idx in range(3, sheet1.max_row + 1):
+                sub_name = str(sheet1.cell(row=row_idx, column=2).value or "").strip()
+                if not sub_name:
+                    continue
+                if sub_name not in workbook.sheetnames:
+                    continue
+                report = report_map.get(sub_name, {})
+                mode = str(report.get("mode", "ISSUE") if isinstance(report, dict) else "ISSUE").upper()
+                rows = _template_topics_for_sub(
+                    sub_name,
+                    issues_top3_by_sub=issues_top3_by_sub,
+                    improvements_top3_by_sub=improvements_top3_by_sub,
+                    report_map=report_map,
+                    preferred_mode=mode,
+                )
+                mode_text = "개선" if mode == "IMPROVE" else "이슈"
+                sheet1.cell(row=row_idx, column=4).value = mode_text
+                sheet1.cell(row=row_idx + 1, column=4).value = "원인 분석" if mode == "ISSUE" else "개선 분석"
+                sheet1.cell(row=row_idx + 2, column=4).value = "Action Items"
+
+                summary_lines: List[str] = []
+                cause_lines: List[str] = []
+                action_lines: List[str] = []
+                for idx, topic in enumerate(rows[:3], start=1):
+                    summary_text = str(topic.get("summary_text", "") or topic.get("why_selected_text", "") or "").strip()
+                    if not summary_text:
+                        summary_text = _template_issue_text(topic)
+                    channel, division, product = _topic_scope(topic)
+                    driver = str(topic.get("primary_driver", "NONE") or "NONE")
+                    summary_lines.append(f"{idx}. {summary_text}")
+                    cause_lines.append(
+                        f"{idx}. {channel}/{division}/{product} | driver={driver} | {_topic_root_cause_text(topic)}"
+                    )
+                    action_lines.append(f"{idx}. {_template_action_text(topic)}")
+
+                sheet1.cell(row=row_idx, column=5).value = "\n".join(summary_lines) if summary_lines else "토픽 없음"
+                sheet1.cell(row=row_idx + 1, column=5).value = "\n".join(cause_lines) if cause_lines else "원인 없음"
+                sheet1.cell(row=row_idx + 2, column=5).value = "\n".join(action_lines) if action_lines else "액션 없음"
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        workbook.save(output_path)
+        workbook.close()
+        return True, "", output_path
+    except PermissionError as exc:
+        return False, str(exc), output_path
+    except Exception as exc:
+        return False, str(exc), output_path
 
 
 def _campaign_sheet_df(rows: List[Dict[str, Any]]) -> pl.DataFrame:
@@ -1007,6 +1314,12 @@ def run_reporting_pipeline(
         issues_top3_by_sub=issues_top3_by_sub,
         improvements_top3_by_sub=improvements_top3_by_sub,
     )
+    subsidiary_issue_action_sheets = _build_subsidiary_issue_action_sheets(
+        subsidiaries=[str(sub) for sub in subsidiaries],
+        subsidiary_reports=subsidiary_reports,
+        issues_top3_by_sub=issues_top3_by_sub,
+        improvements_top3_by_sub=improvements_top3_by_sub,
+    )
     _mark("build_report_rows")
 
     run_metadata = _build_run_metadata(input_path, current_year=current_year, comparison_meta=comparison_meta)
@@ -1065,6 +1378,7 @@ def run_reporting_pipeline(
             "improvements_view": improvements_view_df,
             "division_parallel": division_df,
             "trace": trace_df,
+            **subsidiary_issue_action_sheets,
         },
     )
     raw_calc_saved, raw_calc_error_message, raw_calc_meta, raw_calc_saved_path = save_html_calc_raw_workbook(
@@ -1081,6 +1395,22 @@ def run_reporting_pipeline(
         + ([output_excel_path] if excel_saved else [])
         + ([raw_calc_saved_path] if raw_calc_saved else []),
     )
+    reff_saved, reff_error_message, reff_output_path = _save_reff_format_workbook(
+        project_root=project_root,
+        subsidiaries=[str(sub) for sub in subsidiaries],
+        subsidiary_reports=subsidiary_reports,
+        issues_top3_by_sub=issues_top3_by_sub,
+        improvements_top3_by_sub=improvements_top3_by_sub,
+        comparison_meta=comparison_meta,
+    )
+    if reff_saved:
+        archive_saved_reff, archive_reff_error, _ = _archive_outputs(
+            project_root,
+            week_key=run_metadata["week_key"],
+            output_paths=[reff_output_path],
+        )
+        if not archive_saved_reff and not archive_error_message:
+            archive_error_message = archive_reff_error
     total_elapsed = perf_counter() - pipeline_start
 
     print(
@@ -1114,6 +1444,10 @@ def run_reporting_pipeline(
         print(f"Archived outputs: {archive_dir}")
     else:
         print(f"Archive save skipped: {archive_error_message}")
+    if reff_saved:
+        print(f"Saved Reff format Excel: {reff_output_path}")
+    else:
+        print(f"Reff format save skipped: {reff_error_message}")
 
 
 
