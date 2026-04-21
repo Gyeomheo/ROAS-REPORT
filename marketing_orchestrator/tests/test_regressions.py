@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 import polars as pl
 
+import src.ingestion as ingestion
 from src.application.campaign_action_service import enrich_campaign_actions
 from src.application.report_service import _build_run_metadata, _insight_text
 from src.ingestion import _normalize_long_frame, _normalize_wide_engine_frame
@@ -208,6 +209,49 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         self.assertEqual(metadata["week_key"], "2026-02-20")
         self.assertEqual(metadata["source_hash"], expected_hash)
         self.assertIn("T", metadata["generated_at"])
+
+    def test_read_excel_polars_uses_single_engine_call_with_schema_overrides(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def _fake_read_excel(_path: Path, **kwargs: object) -> pl.DataFrame:
+            calls.append(kwargs)
+            return pl.DataFrame({"SUBSIDIARY": ["SEAU"]})
+
+        with patch("src.ingestion.EXCEL_ENGINE_CANDIDATES", ("calamine",)):
+            with patch("src.ingestion.pl.read_excel", side_effect=_fake_read_excel):
+                frame = ingestion._read_excel_polars(
+                    Path("dummy.xlsx"),
+                    sheet_name="raw",
+                    engine="calamine",
+                    columns=["ACCOUNT", "ACCOUNT_ID"],
+                )
+
+        self.assertEqual(frame.height, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].get("engine"), "calamine")
+        self.assertIn("schema_overrides", calls[0])
+
+    def test_read_with_polars_avoids_column_set_retry_loop(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def _fake_read_polars(_path: Path, **kwargs: object) -> pl.DataFrame:
+            calls.append(kwargs)
+            # Unsupported schema -> force fallback path after bounded attempts.
+            return pl.DataFrame({"UNKNOWN_COL": ["x"]})
+
+        with patch("src.ingestion.pl.read_excel", side_effect=_fake_read_excel):
+            with patch("src.ingestion.EXCEL_ENGINE_CANDIDATES", ("calamine",)):
+                with self.assertRaises(ValueError):
+                    ingestion._read_with_polars(
+                        Path("dummy.xlsx"),
+                        preferred_sheet="raw",
+                        target_sheet="another",
+                    )
+
+        # one read per sheet (another, raw) + one final first-sheet fallback
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(call.get("engine") == "calamine" for call in calls))
+        self.assertTrue(all("columns" not in call for call in calls))
 
 
 if __name__ == "__main__":

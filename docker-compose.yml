@@ -1,0 +1,13 @@
+﻿services:
+  weekly-roas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: weekly-roas
+    working_dir: /app/marketing_orchestrator
+    command: ["python", "main.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./marketing_orchestrator/data:/app/marketing_orchestrator/data
+      - ./marketing_orchestrator/output:/app/marketing_orchestrator/output

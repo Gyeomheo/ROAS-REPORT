@@ -212,7 +212,7 @@ marketing_orchestrator/
 - `Clicks_curr`, `Clicks_prev`, `Orders_curr`, `Orders_prev`
 
 ### C. Long 포맷 (원본 집계형)
-- 지표 원본 컬럼: `PLATFORM_SPEND_USD`, `GROSS_REVENUE`, `PLATFORM_CLICKS`, `GROSS_ORDERS`
+- 지표 원본 컬럼: `PLATFORM_SPEND_USD`, `PLATFORM_REVENUE_USD`, `PLATFORM_CLICKS`, `PLATFORM_TOTAL_CONVERSIONS`
 - 기간 컬럼: `Year/YEAR` (+ 선택 `Month/MONTH`, `Day/DAY`)
 - 선택 필터 컬럼: `OBJECTIVE` (대소문자 변형 허용)
 
@@ -228,8 +228,10 @@ marketing_orchestrator/
 - Python 3.10+
 - 권장 패키지: `polars`, `openpyxl`
 
-### 입력 파일 위치
-- `marketing_orchestrator/data/raw/input.xlsx`
+### 입력 파일 선택
+- 기본 실행 시 `tkinter` 파일 선택창이 열립니다.
+- 자동 입력 파일 스캔/고정 경로 로딩은 사용하지 않습니다.
+- 자동화가 필요하면 `--input-path`로 직접 지정할 수 있습니다.
 
 ### 실행
 ```bash
@@ -240,6 +242,11 @@ python main.py
 ### 연도 지정 실행
 ```bash
 python main.py --curr-year 2026 --prev-year 2025
+```
+
+### 입력 파일 경로 직접 지정
+```bash
+python main.py --input-path "C:\path\to\weekly_roas_input.xlsx"
 ```
 
 ## 8) 설정값 (Environment Variables)

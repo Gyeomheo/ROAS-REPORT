@@ -1,0 +1,7 @@
+﻿.git
+.gitignore
+README.md
+readme_for_marketer.md
+**/__pycache__/
+**/*.pyc
+marketing_orchestrator/output/
