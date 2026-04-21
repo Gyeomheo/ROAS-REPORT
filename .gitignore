@@ -4,3 +4,11 @@
 *.pyd
 marketing_orchestrator/data/
 marketing_orchestrator/output/
+
+# 개발일지 (내부 문서 — 커밋 제외)
+*_개발일지.md
+
+# 참고 파일 / 입력 Excel (내부 데이터 — 커밋 제외)
+Reff/
+*.xlsx
+*.xls
