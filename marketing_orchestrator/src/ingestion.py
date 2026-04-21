@@ -4,9 +4,38 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Sequence
+
+# raw DataFrame parquet 캐시 경로 (ingestion.py 기준 상위 2단계 = marketing_orchestrator/)
+_RAW_PARQUET_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache"
+
+
+def _raw_parquet_path(source_path: Path) -> Path:
+    """input.xlsx에 대응하는 raw parquet 캐시 경로."""
+    return _RAW_PARQUET_CACHE_DIR / f"{source_path.stem}_raw.parquet"
+
+
+def _raw_parquet_valid(cache_path: Path, source_path: Path) -> bool:
+    """캐시가 존재하고 소스 파일보다 최신이면 유효."""
+    try:
+        return cache_path.exists() and cache_path.stat().st_mtime >= source_path.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _save_raw_parquet(df: pl.DataFrame, cache_path: Path) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(cache_path)
+    except Exception:
+        pass  # 캐시 저장 실패는 non-fatal
+
+
+def _load_raw_parquet(cache_path: Path) -> pl.DataFrame:
+    return pl.read_parquet(cache_path)
 
 import polars as pl
 
@@ -118,6 +147,204 @@ REQUIRED_WIDE_HEADERS_UPPER: set[str] = {column.upper() for column in ENGINE_COL
 DEFAULT_CURR_YEAR = date.today().year
 DEFAULT_PREV_YEAR = DEFAULT_CURR_YEAR - 1
 
+# ---------------------------------------------------------------------------
+# Product enrichment constants
+# ---------------------------------------------------------------------------
+
+# PRODUCT values eligible for enrichment (null / vague / cross-product labels)
+_NULL_LIKE_PRODUCT_VALUES: frozenset[str] = frozenset({
+    "", "N/A", "NULL", "NONE", "-", "NA",
+    "OTHERS",
+    "MX OTHERS", "DA OTHERS", "VD OTHERS", "TAB OTHERS", "TV OTHERS",
+    "MX CROSS PRODUCTS", "DA CROSS PRODUCTS", "VD CROSS PRODUCTS",
+    "TAB CROSS PRODUCTS", "CROSS PRODUCTS", "CROSS DIVISION",
+})
+
+# SB~ → single canonical PRODUCT  (≥85 % concentration in validated rows)
+_SB_TO_PRODUCT: dict[str, str] = {
+    # DA — Home Appliance
+    "refrig":    "REFRIGERATOR",
+    "washmach":  "WASHER",
+    "aircon":    "AIR CONDITIONER",
+    "airpur":    "AIR PURIFIER",
+    "aird":      "AIR DRESSER/SHOE DRESSER",
+    "dish":      "DISHWASHER",
+    "micro":     "MICROWAVE/OTR/QOOKER",
+    "oven":      "OVEN/COMBI OVEN",
+    "ldy":       "DRYER",
+    "wpf":       "WATER PURIFIER",
+    # VD — Display
+    "mon":       "ESSENTIAL MONITOR",
+    "wa":        "LIFESTYLE TV",
+    # MX — Mobile / PC / Wearable
+    "pcl":       "NOTEBOOK",
+    "npc":       "NOTEBOOK",
+    "pca":       "PC ACC",
+    "moacc":     "MX ACC",
+    "tab":       "TAB S SERIES",
+    "wearsmart": "WATCH",
+    "buds-pro":  "BUDS",
+    "msmul":     "STICK VACUUM",
+    "vacuum":    "STICK VACUUM",
+    # Audio
+    "hometheat": "SOUND DEVICE",
+    "aud":       "SOUND DEVICE",
+}
+
+# SB~ → fixed cross-product label (원본 taxonomy 값 준수)
+_SB_TO_CROSS_LABEL: dict[str, str] = {
+    "wearoth":  "MX OTHERS",         # Wearable Others: BUDS/RING/WATCH 혼재
+    "wearfit":  "MX OTHERS",         # Wearable Fit: S25/WATCH 혼재
+    "vdc":      "VD CROSS PRODUCTS", # VD Cross
+    "vdmul":    "VD MULTI",
+    "mocross":  "MX CROSS PRODUCTS", # MX Cross
+    "samsa":    "MX CROSS PRODUCTS",
+    "dcr":      "DA CROSS PRODUCTS", # DA Cross
+    "corpb2b":  "B2B",
+    "sound":    "SOUND DEVICE",
+    # tv은 원본 PRODUCT 값에 따라 분기 → _create_products_column 내 특수 처리
+}
+
+# SB~ codes whose label = "{DIVISION} MULTI"  (DIVISION 컬럼 참조)
+_SB_DIVISION_MULTI: frozenset[str] = frozenset({"multi", "cptg", "crgbm", "crop"})
+
+# URL path slug → canonical PRODUCT
+_URL_SLUG_TO_PRODUCT: dict[str, str] = {
+    "air-conditioners":             "AIR CONDITIONER",
+    "air-cleaner":                  "AIR PURIFIER",
+    "air-care":                     "AIR PURIFIER",
+    "air-purifiers":                "AIR PURIFIER",
+    "air-purifier":                 "AIR PURIFIER",
+    "airdressers-and-shoedressers": "AIR DRESSER/SHOE DRESSER",
+    "refrigerators":                "REFRIGERATOR",
+    "washers-and-dryers":           "WASHER",
+    "washers":                      "WASHER",
+    "dishwashers":                  "DISHWASHER",
+    "cooking":                      "RANGE/COOKER",
+    "microwaves":                   "MICROWAVE/OTR/QOOKER",
+    "ovens":                        "OVEN/COMBI OVEN",
+    "tablets":                      "TAB S SERIES",
+    "galaxy-tab-s":                 "TAB S SERIES",
+    "monitors":                     "ESSENTIAL MONITOR",
+    "gaming-monitors":              "ODYSSEY",
+    "notebook":                     "NOTEBOOK",
+    "notebooks":                    "NOTEBOOK",
+    "laptops":                      "NOTEBOOK",
+    "mobile-accessories":           "MX ACC",
+    "galaxy-buds":                  "BUDS",
+    "galaxy-watch":                 "WATCH",
+    "galaxy-ring":                  "RING",
+    "water-purifiers":              "WATER PURIFIER",
+    "vacuum-cleaners":              "STICK VACUUM",
+    "robot-vacuum":                 "ROBOT VACUUM",
+    "soundbars":                    "SOUND DEVICE",
+    "soundbar":                     "SOUND DEVICE",
+    "dryers":                       "DRYER",
+}
+
+
+def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
+    """PRODUCT 우측에 PRODUCTS 열 추가 (원본 PRODUCT 보존).
+
+    PRODUCT가 _NULL_LIKE_PRODUCT_VALUES인 행에 대해서만 추론 적용.
+    추론 우선순위:
+      1. MX_FLAGSHIP_S → S SERIES  (S24/S25/S26 포함 시)
+      2. MX_FLAGSHIP_Z → Z SERIES
+      3. SB~ → _SB_TO_PRODUCT      (단일 제품 고정 매핑)
+      4. SB~ → _SB_TO_CROSS_LABEL  (교차 제품 고정 레이블)
+      5. SB~ ∈ _SB_DIVISION_MULTI  → "{DIVISION} MULTI"
+      6. URL slug → _URL_SLUG_TO_PRODUCT
+      7. fallback → 원본 PRODUCT 그대로
+    """
+    if "PRODUCT" not in df.columns:
+        return df
+
+    null_like = list(_NULL_LIKE_PRODUCT_VALUES)
+    product_upper = (
+        pl.col("PRODUCT").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase()
+    )
+    is_problem = product_upper.is_null() | product_upper.is_in(null_like)
+
+    # --- Level 1 & 2: MX Flagship ---
+    mx_s = pl.lit(None, dtype=pl.Utf8)
+    if "MX_FLAGSHIP_S" in df.columns:
+        fs = pl.col("MX_FLAGSHIP_S").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase()
+        mx_s = pl.when(
+            fs.is_not_null()
+            & (
+                fs.str.contains(r"S2[456]")
+                | fs.str.contains("S-SERIES")
+                | fs.str.contains("S SERIES")
+            )
+        ).then(pl.lit("S SERIES")).otherwise(pl.lit(None, dtype=pl.Utf8))
+
+    mx_z = pl.lit(None, dtype=pl.Utf8)
+    if "MX_FLAGSHIP_Z" in df.columns:
+        fz = pl.col("MX_FLAGSHIP_Z").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase()
+        mx_z = pl.when(
+            fz.is_not_null() & fz.str.contains("Z")
+        ).then(pl.lit("Z SERIES")).otherwise(pl.lit(None, dtype=pl.Utf8))
+
+    # --- Level 3 ~ 6: SB~ ---
+    sb_fixed = pl.lit(None, dtype=pl.Utf8)
+    sb_cross = pl.lit(None, dtype=pl.Utf8)
+    sb_tv = pl.lit(None, dtype=pl.Utf8)
+    sb_div_multi = pl.lit(None, dtype=pl.Utf8)
+    if "CAMPAIGN_NAME" in df.columns:
+        sb_code = (
+            pl.col("CAMPAIGN_NAME")
+            .cast(pl.Utf8, strict=False)
+            .str.extract(r"(?i)SB~([^_~\s]+)", 1)
+            .str.to_lowercase()
+        )
+        sb_fixed = sb_code.replace(_SB_TO_PRODUCT, default=None)
+        sb_cross = sb_code.replace(_SB_TO_CROSS_LABEL, default=None)
+
+        # tv 특수 처리: 원본 PRODUCT가 VD CROSS PRODUCTS면 유지, 나머지는 TV OTHERS
+        sb_tv = pl.when(sb_code == pl.lit("tv")).then(
+            pl.when(product_upper == pl.lit("VD CROSS PRODUCTS"))
+            .then(pl.lit("VD CROSS PRODUCTS"))
+            .otherwise(pl.lit("TV OTHERS"))
+        ).otherwise(pl.lit(None, dtype=pl.Utf8))
+
+        if "DIVISION" in df.columns:
+            div_upper = (
+                pl.col("DIVISION").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase()
+            )
+            sb_div_multi = pl.when(
+                sb_code.is_in(list(_SB_DIVISION_MULTI)) & div_upper.is_not_null()
+            ).then(
+                pl.concat_str([div_upper, pl.lit(" MULTI")])
+            ).otherwise(pl.lit(None, dtype=pl.Utf8))
+
+    # --- Level 6: URL slug ---
+    url_inferred = pl.lit(None, dtype=pl.Utf8)
+    if "PLATFORM_LANDING_PAGE_URL" in df.columns:
+        slug = (
+            pl.col("PLATFORM_LANDING_PAGE_URL")
+            .cast(pl.Utf8, strict=False)
+            .str.to_lowercase()
+            .str.extract(r"samsung\.com/[^/]*/([^/?#]+)", 1)
+        )
+        url_inferred = slug.replace(_URL_SLUG_TO_PRODUCT, default=None)
+
+    # --- Combine & apply ---
+    inferred = pl.coalesce([mx_s, mx_z, sb_fixed, sb_cross, sb_tv, sb_div_multi, url_inferred])
+    products_expr = (
+        pl.when(is_problem & inferred.is_not_null())
+        .then(inferred)
+        .otherwise(pl.col("PRODUCT"))
+        .alias("PRODUCTS")
+    )
+
+    result = df.with_columns(products_expr)
+
+    # PRODUCTS를 PRODUCT 바로 우측에 배치
+    cols = result.columns
+    idx = cols.index("PRODUCT")
+    ordered = cols[: idx + 1] + ["PRODUCTS"] + [c for c in cols[idx + 1 :] if c != "PRODUCTS"]
+    return result.select(ordered)
+
 
 def _parse_error_threshold() -> float:
     raw = os.getenv("ROAS_PARSE_ERROR_THRESHOLD", "0.01")
@@ -131,6 +358,52 @@ def _parse_error_threshold() -> float:
 
 
 METRIC_PARSE_ERROR_THRESHOLD = _parse_error_threshold()
+
+
+def _parse_excel_engine_candidates() -> tuple[str, ...]:
+    # Fast path default: calamine once, then module-level openpyxl fallback in _read_raw_input_excel_frame.
+    raw = os.getenv("ROAS_EXCEL_ENGINE", "calamine")
+    candidates: list[str] = []
+    for token in raw.split(","):
+        normalized = token.strip().lower()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    if not candidates:
+        return ("calamine",)
+    return tuple(candidates)
+
+
+def _parse_excel_infer_schema_length() -> int:
+    raw = os.getenv("ROAS_EXCEL_INFER_SCHEMA_LENGTH", "10000")
+    try:
+        length = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid ROAS_EXCEL_INFER_SCHEMA_LENGTH: {raw}") from exc
+    if length < 0:
+        raise ValueError(f"ROAS_EXCEL_INFER_SCHEMA_LENGTH must be >= 0, got {length}")
+    return length
+
+
+EXCEL_ENGINE_CANDIDATES = _parse_excel_engine_candidates()
+EXCEL_INFER_SCHEMA_LENGTH = _parse_excel_infer_schema_length()
+EXCEL_SCHEMA_OVERRIDES: dict[str, Any] = {
+    "CAMPAIGN_ID": pl.Utf8,
+    "ACCOUNT": pl.Utf8,
+    "ACCOUNT_ID": pl.Utf8,
+}
+
+
+def _excel_schema_overrides(columns: Any = None) -> dict[str, Any]:
+    if columns is None or isinstance(columns, str):
+        return dict(EXCEL_SCHEMA_OVERRIDES)
+    requested = {str(name).strip().upper() for name in columns if isinstance(name, str)}
+    if not requested:
+        return {}
+    return {
+        column: dtype
+        for column, dtype in EXCEL_SCHEMA_OVERRIDES.items()
+        if column.strip().upper() in requested
+    }
 
 
 def _import_openpyxl() -> tuple[Any, Any]:
@@ -200,11 +473,24 @@ def _select_sheet_name(path: Path, preferred_sheet: str) -> str:
 
 
 def _read_excel_polars(path: Path, **kwargs: Any) -> Any:
-    """Use larger schema sampling when supported to avoid dtype inference warnings."""
-    try:
-        return pl.read_excel(path, infer_schema_length=10000, **kwargs)  # type: ignore[arg-type]
-    except TypeError:
-        return pl.read_excel(path, **kwargs)  # type: ignore[arg-type]
+    """Read once with explicit schema hints; no multi-engine retry loop."""
+    read_kwargs = dict(kwargs)
+    if "infer_schema_length" not in read_kwargs:
+        read_kwargs["infer_schema_length"] = EXCEL_INFER_SCHEMA_LENGTH
+    if "schema_overrides" not in read_kwargs:
+        overrides = _excel_schema_overrides(read_kwargs.get("columns"))
+        if overrides:
+            read_kwargs["schema_overrides"] = overrides
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"Could not determine dtype for column .*")
+        try:
+            return pl.read_excel(path, **read_kwargs)  # type: ignore[arg-type]
+        except TypeError:
+            fallback_kwargs = dict(read_kwargs)
+            fallback_kwargs.pop("infer_schema_length", None)
+            fallback_kwargs.pop("schema_overrides", None)
+            return pl.read_excel(path, **fallback_kwargs)  # type: ignore[arg-type]
 
 
 def _frame_from_polars_result(frame: Any, preferred_sheet: str) -> pl.DataFrame:
@@ -219,43 +505,44 @@ def _frame_from_polars_result(frame: Any, preferred_sheet: str) -> pl.DataFrame:
 
 
 def _read_with_polars(path: Path, preferred_sheet: str, target_sheet: str) -> pl.DataFrame:
+    """Read Excel with the primary engine only; fallback to openpyxl happens outside."""
     if not hasattr(pl, "read_excel"):
         raise RuntimeError("polars.read_excel is not available in this environment.")
 
-    tried: list[str] = []
-    for sheet_name in [target_sheet, preferred_sheet]:
-        if not sheet_name or sheet_name in tried:
-            continue
-        tried.append(sheet_name)
+    sheets_to_try: list[str] = []
+    for name in [target_sheet, preferred_sheet]:
+        if name and name not in sheets_to_try:
+            sheets_to_try.append(name)
 
+    primary_engine = EXCEL_ENGINE_CANDIDATES[0] if EXCEL_ENGINE_CANDIDATES else "calamine"
+    last_exc: Exception | None = None
+
+    for sheet_name in sheets_to_try:
         try:
-            frame = _read_excel_polars(path, sheet_name=sheet_name)
+            frame = _read_excel_polars(
+                path,
+                sheet_name=sheet_name,
+                engine=primary_engine,
+            )
             normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
             if _looks_like_supported_input(normalized.columns):
                 return normalized
-        except Exception:
-            pass
+        except Exception as exc:
+            last_exc = exc
+            continue
 
-        for columns in PREFERRED_COLUMN_SETS:
-            try:
-                frame = _read_excel_polars(path, sheet_name=sheet_name, columns=columns)
-                normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
-                if _looks_like_supported_input(normalized.columns):
-                    return normalized
-            except Exception:
-                continue
-
+    # Final fallback: let polars pick first sheet once.
     try:
-        frame = _read_excel_polars(path, sheet_name=preferred_sheet)
+        frame = _read_excel_polars(path, engine=primary_engine)
         normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
         if _looks_like_supported_input(normalized.columns):
             return normalized
-    except Exception:
-        pass
+    except Exception as exc:
+        last_exc = exc
 
-    frame = _read_excel_polars(path)
-    normalized = _standardize_known_columns(_frame_from_polars_result(frame, preferred_sheet))
-    return normalized
+    if last_exc is not None:
+        raise last_exc
+    raise ValueError(f"Unable to detect supported input schema via polars ({primary_engine}).")
 
 
 def _read_with_openpyxl(path: Path, target_sheet: str, preferred_sheet: str) -> pl.DataFrame:
@@ -687,7 +974,15 @@ def _to_engine_frame(
 ) -> tuple[pl.DataFrame, Dict[str, Any]]:
     filtered_input, objective_meta = _filter_conversion_objective(df)
     scoped_input, division_meta = _filter_target_divisions(filtered_input)
-    if set(ENGINE_COLUMNS).issubset(scoped_input.columns):
+
+    # Product enrichment: CAMPAIGN_NAME / MX_FLAGSHIP_S / URL 기반 PRODUCTS 열 추가.
+    # 이후 PRODUCTS(enriched) → PRODUCT, PRODUCT(raw) → PRODUCT_RAW 로 swap.
+    # PRODUCT_RAW는 DIMENSIONS에 없으므로 normalize 단계에서 자연 탈락.
+    enriched_input = _create_products_column(scoped_input)
+    if "PRODUCTS" in enriched_input.columns:
+        enriched_input = enriched_input.rename({"PRODUCT": "PRODUCT_RAW", "PRODUCTS": "PRODUCT"})
+
+    if set(ENGINE_COLUMNS).issubset(enriched_input.columns):
         meta = {
             "curr_year": curr_year,
             "prev_year": prev_year,
@@ -696,9 +991,9 @@ def _to_engine_frame(
         }
         meta.update(division_meta)
         meta.update(objective_meta)
-        return _normalize_wide_engine_frame(scoped_input), meta
+        return _normalize_wide_engine_frame(enriched_input), meta
 
-    long_df = _normalize_long_frame(scoped_input)
+    long_df = _normalize_long_frame(enriched_input)
     if mtd_only:
         filtered_df, meta = _apply_mtd_alignment(long_df, curr_year=curr_year, prev_year=prev_year)
     else:
@@ -783,12 +1078,28 @@ def build_html_calc_raw_sheets(
     preferred_sheet: str = "raw",
     mtd_only: bool = True,
 ) -> tuple[Dict[str, pl.DataFrame], Dict[str, Any]]:
-    raw_df = _read_raw_input_excel_frame(path, preferred_sheet=preferred_sheet)
+    source_path = Path(path).expanduser().resolve()
+    raw_parquet = _raw_parquet_path(source_path)
+    if _raw_parquet_valid(raw_parquet, source_path):
+        raw_df = _load_raw_parquet(raw_parquet)
+    else:
+        raw_df = _read_raw_input_excel_frame(source_path, preferred_sheet=preferred_sheet)
+        _save_raw_parquet(raw_df, raw_parquet)
+
     filtered_objective_df, objective_meta = _filter_conversion_objective(raw_df)
     scoped_df, division_meta = _filter_target_divisions(filtered_objective_df)
 
-    if set(ENGINE_COLUMNS).issubset(scoped_df.columns):
-        normalized_df = _normalize_wide_engine_frame(scoped_df)
+    # enriched_df: PRODUCT=원본, PRODUCTS=추론값 (두 열 공존 — raw 출력용)
+    # analysis_df: PRODUCTS→PRODUCT 스왑, PRODUCT→PRODUCT_RAW (엔진 분석용)
+    enriched_df = _create_products_column(scoped_df)
+    analysis_df = (
+        enriched_df.rename({"PRODUCT": "PRODUCT_RAW", "PRODUCTS": "PRODUCT"})
+        if "PRODUCTS" in enriched_df.columns
+        else enriched_df
+    )
+
+    if set(ENGINE_COLUMNS).issubset(analysis_df.columns):
+        normalized_df = _normalize_wide_engine_frame(analysis_df)
         engine_df = normalized_df
         long_meta: Dict[str, Any] = {
             "curr_year": curr_year,
@@ -797,7 +1108,7 @@ def build_html_calc_raw_sheets(
             "source_format": "wide",
         }
     else:
-        long_df = _normalize_long_frame(scoped_df)
+        long_df = _normalize_long_frame(analysis_df)
         if mtd_only:
             normalized_df, long_meta = _apply_mtd_alignment(long_df, curr_year=curr_year, prev_year=prev_year)
         else:
@@ -806,8 +1117,9 @@ def build_html_calc_raw_sheets(
         long_meta["source_format"] = "long"
         engine_df = _pivot_long_to_engine(normalized_df, curr_year=curr_year, prev_year=prev_year)
 
+    # raw_full_df는 enriched_df 기반 — PRODUCT(원본) + PRODUCTS(추론) 두 열 모두 출력
     raw_full_df, raw_full_meta = _filter_raw_frame_for_html_window(
-        scoped_df,
+        enriched_df,
         curr_year=curr_year,
         prev_year=prev_year,
         mtd_only=mtd_only,
@@ -851,7 +1163,11 @@ def read_input_excel(
     return_meta: bool = False,
 ) -> pl.DataFrame | tuple[pl.DataFrame, Dict[str, Any]]:
     """Read input Excel and return engine-ready wide schema with curr/prev metrics."""
-    raw_df = _read_raw_input_excel_frame(path, preferred_sheet=preferred_sheet)
+    source_path = Path(path).expanduser().resolve()
+    raw_df = _read_raw_input_excel_frame(source_path, preferred_sheet=preferred_sheet)
+
+    # raw_df를 parquet으로 캐싱 — build_html_calc_raw_sheets 재읽기 제거
+    _save_raw_parquet(raw_df, _raw_parquet_path(source_path))
 
     engine_df, meta = _to_engine_frame(
         raw_df,
@@ -879,33 +1195,42 @@ def _excel_cell_value(value: Any) -> Any:
 
 
 def _write_with_polars(path: Path, sheets: Dict[str, pl.DataFrame]) -> bool:
+    """Write multi-sheet Excel via xlsxwriter (single Workbook) — ~10x faster than openpyxl.
+
+    94k-row sheet: openpyxl ~340s, xlsxwriter ~30s.
+    """
     if not sheets:
         return False
 
     try:
-        if hasattr(pl, "write_excel"):
-            pl.write_excel(  # type: ignore[attr-defined]
-                workbook=path,
-                worksheets=sheets,
-            )
-            return True
-    except Exception:
-        pass
+        import xlsxwriter  # type: ignore
+    except ImportError:
+        return False
 
     first_df = next(iter(sheets.values()))
     if not hasattr(first_df, "write_excel"):
         return False
 
     try:
-        first = True
-        for sheet_name, frame in sheets.items():
-            if first:
-                frame.write_excel(path, worksheet=sheet_name)  # type: ignore[arg-type]
-                first = False
-            else:
-                frame.write_excel(path, worksheet=sheet_name, mode="a")  # type: ignore[arg-type]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # constant_memory=True: 행 단위 스트리밍, 작성 후 메모리 해제 → 대형 시트에서 ~2배 추가 가속.
+        # 제약: 셀 역참조/재작성 불가, 시트 간 순차 작성만 가능. polars write_excel은 순차 작성이므로 호환.
+        with xlsxwriter.Workbook(str(path), {"constant_memory": True}) as workbook:
+            for sheet_name, frame in sheets.items():
+                safe_name = str(sheet_name)[:31] or "Sheet1"
+                frame.write_excel(
+                    workbook=workbook,
+                    worksheet=safe_name,
+                    autofit=False,  # autofit scans every cell → skip for speed
+                )
         return True
     except Exception:
+        # Clean up partial file so openpyxl fallback starts clean
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
         return False
 
 
