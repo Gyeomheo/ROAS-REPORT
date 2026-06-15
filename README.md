@@ -19,7 +19,13 @@
 ## 1) 시스템 아키텍처
 
 ```text
-main.py (CLI Entrypoint)
+cleansing.py (Cleansing Entrypoint)
+  -> application.report_service.run_cleansing_pipeline
+      -> infrastructure.excel_repository.save_html_calc_raw_workbook
+          -> ingestion.build_html_calc_raw_sheets
+          -> output/GMPD RAW_Cleaned_YYYYMMDD_HHMMSS.xlsx
+
+main.py (Report Entrypoint)
   -> application.report_service.run_reporting_pipeline (Orchestrator)
       -> infrastructure.excel_repository.load_input_frame
           -> ingestion.read_input_excel (Polars-first, openpyxl fallback, DQ check)
@@ -40,7 +46,8 @@ main.py (CLI Entrypoint)
 ## 2) 설계 철학
 
 ### A. Orchestrator-First
-- `main.py`는 입력 인자 처리 후 오케스트레이터(`run_reporting_pipeline`)만 호출합니다.
+- `cleansing.py`는 입력 인자 처리 후 클렌징 오케스트레이터(`run_cleansing_pipeline`)만 호출합니다.
+- `main.py`는 입력 인자 처리 후 리포트 오케스트레이터(`run_reporting_pipeline`)만 호출합니다.
 - 파이프라인 제어는 `report_service`에서 단일 책임으로 수행합니다.
 
 ### B. Layered Architecture
@@ -163,6 +170,7 @@ CVR × AOV ÷ CPC
 
 ```text
 marketing_orchestrator/
+  cleansing.py
   main.py
   src/
     __init__.py
@@ -170,6 +178,7 @@ marketing_orchestrator/
     impact.py
     root_cause.py
     application/
+      cli.py
       analysis_service.py
       campaign_action_service.py
       report_service.py
@@ -189,14 +198,27 @@ marketing_orchestrator/
 
 ## 5) 실행 플로우 (현재 코드 기준)
 
-1. `data/raw/input.xlsx` 로드
-2. 스키마 정규화(wide/long 자동 감지), OBJECTIVE/DIVISION 필터, MTD 정렬
+### 클렌징만 실행
+
+1. 파일 선택창 또는 `--input-path`로 원본 Excel 로드
+2. 스키마 정규화(wide/long 자동 감지), OBJECTIVE/DIVISION 필터, 제품명 보정
+3. 분석용 `engine_html_input` 시트와 검수용 raw 시트를 생성
+4. `output/GMPD RAW_Cleaned_YYYYMMDD_HHMMSS.xlsx` 저장
+
+### 이슈분석만 실행
+
+1. 파일 선택창 또는 `--input-path`로 `GMPD RAW_Cleaned_...xlsx` 로드
+2. `engine_html_input` 시트를 분석 입력으로 사용
 3. `SUBSIDIARY` 단위로 ImpactEngine 실행
 4. Top campaign 대상 RootCauseEngine 실행
 5. 도메인 액션 추천(`recommended_actions`, `action_checklist`) 부여
 6. 제품/사업부/법인 레벨 리포트 행 구성 및 Top3 선택
-7. `summary.json`, `summary.html`, `summary.xlsx` 생성
+7. `summary.json`, `summary.html`, `summary.xlsx`, `ROAS Report Format_filled_...xlsx` 생성
 8. 단계별 실행 시간 로그 출력
+
+### 전체 한 번에 실행
+
+`main.py` 기본 실행은 클렌징과 이슈분석을 한 번에 수행합니다.
 
 연도 결정 규칙(코드 기준):
 - 우선순위: CLI 인자(`--curr-year`, `--prev-year`) > 환경변수(`ROAS_CURRENT_YEAR`, `ROAS_PREVIOUS_YEAR`) > 시스템 현재연도/전년
@@ -233,9 +255,23 @@ marketing_orchestrator/
 - 자동 입력 파일 스캔/고정 경로 로딩은 사용하지 않습니다.
 - 자동화가 필요하면 `--input-path`로 직접 지정할 수 있습니다.
 
-### 실행
+### 클렌징만 먼저 실행
 ```bash
 cd marketing_orchestrator
+python cleansing.py
+```
+
+파일 선택창에서 원본 Excel을 고르면 `output/GMPD RAW_Cleaned_YYYYMMDD_HHMMSS.xlsx`만 생성됩니다.
+
+### 이슈분석만 따로 실행
+```bash
+python main.py --mode analyze
+```
+
+파일 선택창에서 `output/GMPD RAW_Cleaned_...xlsx`를 선택합니다.
+
+### 전체 한 번에 실행
+```bash
 python main.py
 ```
 
@@ -246,7 +282,8 @@ python main.py --curr-year 2026 --prev-year 2025
 
 ### 입력 파일 경로 직접 지정
 ```bash
-python main.py --input-path "C:\path\to\weekly_roas_input.xlsx"
+python cleansing.py --input-path "C:\path\to\weekly_roas_input.xlsx"
+python main.py --mode analyze --input-path "C:\path\to\GMPD RAW_Cleaned_YYYYMMDD_HHMMSS.xlsx"
 ```
 
 ## 8) 설정값 (Environment Variables)
@@ -311,6 +348,7 @@ src.run_reporting_pipeline(curr_year=2026, prev_year=2025)
 
 ## 12) 현재 인터페이스 상태
 
-- 권장 엔트리포인트: `marketing_orchestrator/main.py`
+- 클렌징 엔트리포인트: `marketing_orchestrator/cleansing.py`
+- 리포트 엔트리포인트: `marketing_orchestrator/main.py`
 - 오케스트레이션 API: `from src.application import run_reporting_pipeline`
 - 레거시 HTML 렌더러는 `src/infrastructure/html_report_legacy.py`로 이동되어 인프라 계층으로 격리되었습니다.

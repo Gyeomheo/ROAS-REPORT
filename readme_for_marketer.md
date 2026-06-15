@@ -12,11 +12,35 @@
 - 결과물을 JSON / HTML / Excel로 생성
 
 ## 3) 실행 전에 준비할 것
-- 입력 파일 위치: `marketing_orchestrator/data/raw/input.xlsx`
+- 원본 Excel 파일 위치 확인 (실행 시 파일 선택창에서 고름)
 - Python 3.10+
 - 권장 패키지: `polars`, `openpyxl`
 
 ## 4) 실행 방법
+
+### 클렌징만 먼저 실행
+
+VS Code 터미널에서:
+
+```bash
+cd marketing_orchestrator
+python cleansing.py
+```
+
+파일 선택창에서 원본 Excel을 고르면 `output/GMPD RAW_Cleaned_YYYYMMDD_HHMMSS.xlsx`만 생성됩니다.
+
+### 이슈분석만 따로 실행
+
+클렌징 결과 파일을 선택해서 이슈분석/리포트만 실행:
+
+```bash
+python main.py --mode analyze
+```
+
+파일 선택창에서 `output/GMPD RAW_Cleaned_...xlsx`를 선택합니다.
+
+### 전체 한 번에 실행
+
 ```bash
 cd marketing_orchestrator
 python main.py

@@ -634,16 +634,25 @@ def _to_report_rows(
                 "topic_roas_curr": topic_roas_curr,
                 "topic_roas_prev": topic_roas_prev,
                 "topic_roas_delta": topic_roas_delta,
+                "Revenue_curr_sum": row.get("Revenue_curr_sum"),
+                "Revenue_prev_sum": row.get("Revenue_prev_sum"),
+                "Spend_curr_sum": row.get("Spend_curr_sum"),
+                "Spend_prev_sum": row.get("Spend_prev_sum"),
             }
         )
     return report_rows
 
 
-def _top3_by_subsidiary(rows: List[Dict[str, Any]], descending: bool) -> Dict[str, List[Dict[str, Any]]]:
+def _top3_by_subsidiary(
+    rows: List[Dict[str, Any]],
+    descending: bool,
+    issue_candidate_gate: bool = False,
+) -> Dict[str, List[Dict[str, Any]]]:
     return reporting_selectors.top3_by_subsidiary(
         rows,
         descending=descending,
         min_topic_roas_abs_delta=MIN_TOPIC_ROAS_ABS_DELTA,
+        issue_candidate_gate=issue_candidate_gate,
     )
 
 
@@ -900,31 +909,88 @@ def _template_topics_for_sub(
     return issue_rows if issue_rows else improve_rows
 
 
+def _channel_display_name(channel: str) -> str:
+    normalized = str(channel or "").strip().upper()
+    mapping = {
+        "SEARCH": "Paid Search",
+        "SOCIAL": "Paid Social",
+        "PMAX": "PMAX",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    if not normalized:
+        return "Unknown"
+    return normalized.title()
+
+
+def _fmt_roas_compact(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    text = f"{_to_float(value):.2f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _compact_reason_text(text: str, max_len: int = 120) -> str:
+    one_line = " ".join(str(text or "").replace("\n", " ").split())
+    if not one_line:
+        return "원인 분석 필요"
+    if "선정근거:" in one_line:
+        one_line = one_line.split("선정근거:", 1)[0].strip()
+    if len(one_line) > max_len:
+        return one_line[: max_len - 1].rstrip() + "…"
+    return one_line
+
+
 def _template_issue_text(row: Dict[str, Any]) -> str:
-    channel, division, product = _topic_scope(row)
-    summary = str(row.get("summary_text", "") or row.get("why_selected_text", "") or "").strip()
-    root_cause = _topic_root_cause_text(row)
-    prefix = "/".join([token for token in [channel, division, product] if token])
-    parts = []
-    if prefix:
-        parts.append(prefix)
-    if summary:
-        parts.append(summary)
-    if root_cause:
-        parts.append(f"원인분석: {root_cause}")
-    return " | ".join(parts)
+    channel, division, _product = _topic_scope(row)
+    channel_display = _channel_display_name(channel)
+    division_display = str(division or "N/A").upper()
+
+    roas_prev = row.get("topic_roas_prev")
+    if roas_prev is None:
+        roas_prev = _safe_ratio(_to_float(row.get("Revenue_prev_sum")), _to_float(row.get("Spend_prev_sum")))
+    roas_curr = row.get("topic_roas_curr")
+    if roas_curr is None:
+        roas_curr = _safe_ratio(_to_float(row.get("Revenue_curr_sum")), _to_float(row.get("Spend_curr_sum")))
+    roas_yoy = _safe_pct_change(roas_curr, roas_prev)
+
+    driver = str(row.get("primary_driver", "NONE") or "NONE").upper()
+    if driver not in {"CPC", "CVR", "AOV"}:
+        driver = "NONE"
+
+    reason_seed = str(row.get("why_selected_text", "") or "").strip()
+    if not reason_seed:
+        reason_seed = _topic_root_cause_text(row)
+    reason = _compact_reason_text(reason_seed, max_len=120)
+
+    return (
+        f"{division_display} {channel_display} : "
+        f"ROAS {_fmt_roas_compact(roas_prev)} → {_fmt_roas_compact(roas_curr)} "
+        f"({_fmt_pct(roas_yoy)}) — {driver} {reason}"
+    )
 
 
 def _template_action_text(row: Dict[str, Any]) -> str:
+    _channel, division, _product = _topic_scope(row)
+    division_display = str(division or "N/A").upper()
     action = str(row.get("recommended_actions", "") or "").strip()
     checklist = str(row.get("action_checklist", "") or "").strip()
-    if action and checklist:
-        return f"{action} | {checklist}"
     if action:
-        return action
+        action = action.split("|", 1)[0].strip()
+        action = " ".join(action.replace("\n", " ").split())
     if checklist:
-        return checklist
-    return "액션 없음"
+        checklist = checklist.split("|", 1)[0].strip()
+        checklist = " ".join(checklist.replace("\n", " ").split())
+
+    if action and checklist:
+        return f"{division_display}: {action} ({checklist})"
+    if action:
+        return f"{division_display}: {action}"
+    if checklist:
+        return f"{division_display}: {checklist}"
+    return f"{division_display}: 액션 없음"
 
 
 def _save_reff_format_workbook(
@@ -934,9 +1000,11 @@ def _save_reff_format_workbook(
     issues_top3_by_sub: Dict[str, List[Dict[str, Any]]],
     improvements_top3_by_sub: Dict[str, List[Dict[str, Any]]],
     comparison_meta: Dict[str, Any],
+    output_path: Path | None = None,
 ) -> tuple[bool, str, Path]:
     template_path = project_root.parent / "Reff" / "ROAS Report Format.xlsx"
-    output_path = project_root / "output" / "ROAS Report Format_filled.xlsx"
+    if output_path is None:
+        output_path = project_root / "output" / "ROAS Report Format_filled.xlsx"
     if not template_path.exists():
         return False, f"Template not found: {template_path}", output_path
 
@@ -953,21 +1021,11 @@ def _save_reff_format_workbook(
         if sub:
             report_map[sub] = report
 
-    curr_year = int(comparison_meta.get("curr_year", date.today().year))
-    prev_year = int(comparison_meta.get("prev_year", curr_year - 1))
-    mtd_month = comparison_meta.get("mtd_month_cutoff") or comparison_meta.get("mtd_month_start")
-    mtd_day = comparison_meta.get("mtd_day_cutoff")
-    if mtd_month and mtd_day:
-        period_text = f"({curr_year} MTD 1/1 - {int(mtd_month)}/{int(mtd_day)})"
-    elif mtd_month:
-        period_text = f"({curr_year} MTD month {int(mtd_month)})"
-    else:
-        period_text = f"({curr_year} vs {prev_year})"
-    source_line = f"* Source: GMPD RAW, LMDI pipeline, {prev_year} & {curr_year} {period_text}"
-    method_line = "** Data Source: Impact(LMDI) + RCA(CVR/AOV/CPC) + rule-based action recommendation"
-
     try:
-        workbook = load_workbook(template_path)
+        # External link relationships in the template can be rewritten inconsistently
+        # when saving with openpyxl, which triggers Excel "repair" prompts.
+        # We do not use link-updating in this pipeline, so drop links on load.
+        workbook = load_workbook(template_path, keep_links=False)
         for sub in subsidiaries:
             if sub not in workbook.sheetnames:
                 continue
@@ -981,9 +1039,6 @@ def _save_reff_format_workbook(
                 report_map=report_map,
                 preferred_mode=mode,
             )
-
-            worksheet.cell(row=2, column=2).value = source_line
-            worksheet.cell(row=3, column=2).value = method_line
 
             issue_texts = [_template_issue_text(row) for row in rows[:3]]
             action_texts = [_template_action_text(row) for row in rows[:3]]
@@ -1020,12 +1075,9 @@ def _save_reff_format_workbook(
                 cause_lines: List[str] = []
                 action_lines: List[str] = []
                 for idx, topic in enumerate(rows[:3], start=1):
-                    summary_text = str(topic.get("summary_text", "") or topic.get("why_selected_text", "") or "").strip()
-                    if not summary_text:
-                        summary_text = _template_issue_text(topic)
                     channel, division, product = _topic_scope(topic)
                     driver = str(topic.get("primary_driver", "NONE") or "NONE")
-                    summary_lines.append(f"{idx}. {summary_text}")
+                    summary_lines.append(f"{idx}. {_template_issue_text(topic)}")
                     cause_lines.append(
                         f"{idx}. {channel}/{division}/{product} | driver={driver} | {_topic_root_cause_text(topic)}"
                     )
@@ -1269,6 +1321,8 @@ def run_reporting_pipeline(
     input_path: str | Path,
     curr_year: int | None = None,
     prev_year: int | None = None,
+    input_sheet: str | None = None,
+    save_cleansed_workbook: bool = True,
 ) -> None:
     pipeline_start = perf_counter()
     stage_start = pipeline_start
@@ -1283,9 +1337,10 @@ def run_reporting_pipeline(
 
     project_root = Path(__file__).resolve().parents[2]
     input_path = Path(input_path).expanduser().resolve()
+    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_json_path = project_root / "output" / "summary.json"
     output_excel_path = project_root / "output" / "summary.xlsx"
-    output_raw_calc_excel_path = project_root / "output" / "raw_html_mtd_conversion_extrevenue.xlsx"
+    output_raw_calc_excel_path = project_root / "output" / f"GMPD RAW_Cleaned_{_ts}.xlsx"
     output_html_path = project_root / "output" / "summary.html"
 
     df, comparison_meta = load_input_frame(
@@ -1293,6 +1348,7 @@ def run_reporting_pipeline(
         curr_year=current_year,
         prev_year=previous_year,
         cache_root=project_root,
+        preferred_sheet=input_sheet or "raw",
     )
     _mark("load_input_frame")
     analysis = run_subsidiary_analysis(df, dimensions=DIMENSIONS)
@@ -1305,8 +1361,16 @@ def run_reporting_pipeline(
     scope_maps = _scope_maps(df)
     issues_report_rows = _to_report_rows(issues_with_actions, df=df, scope_maps=scope_maps)
     improvements_report_rows = _to_report_rows(improvements_with_actions, df=df, scope_maps=scope_maps)
-    issues_top3_by_sub = _top3_by_subsidiary(issues_report_rows, descending=True)
-    improvements_top3_by_sub = _top3_by_subsidiary(improvements_report_rows, descending=True)
+    issues_top3_by_sub = _top3_by_subsidiary(
+        issues_report_rows,
+        descending=True,
+        issue_candidate_gate=True,
+    )
+    improvements_top3_by_sub = _top3_by_subsidiary(
+        improvements_report_rows,
+        descending=True,
+        issue_candidate_gate=False,
+    )
     division_parallel = _division_parallel_contribution(df)
     subsidiary_reports = _build_subsidiary_reports(
         df,
@@ -1381,12 +1445,17 @@ def run_reporting_pipeline(
             **subsidiary_issue_action_sheets,
         },
     )
-    raw_calc_saved, raw_calc_error_message, raw_calc_meta, raw_calc_saved_path = save_html_calc_raw_workbook(
-        output_raw_calc_excel_path,
-        input_path=input_path,
-        curr_year=current_year,
-        prev_year=previous_year,
-    )
+    raw_calc_saved = False
+    raw_calc_error_message = ""
+    raw_calc_meta: Dict[str, Any] = {}
+    raw_calc_saved_path = output_raw_calc_excel_path
+    if save_cleansed_workbook:
+        raw_calc_saved, raw_calc_error_message, raw_calc_meta, raw_calc_saved_path = save_html_calc_raw_workbook(
+            output_raw_calc_excel_path,
+            input_path=input_path,
+            curr_year=current_year,
+            prev_year=previous_year,
+        )
     _mark("save_excel")
     archive_saved, archive_error_message, archive_dir = _archive_outputs(
         project_root,
@@ -1402,6 +1471,7 @@ def run_reporting_pipeline(
         issues_top3_by_sub=issues_top3_by_sub,
         improvements_top3_by_sub=improvements_top3_by_sub,
         comparison_meta=comparison_meta,
+        output_path=project_root / "output" / f"ROAS Report Format_filled_{_ts}.xlsx",
     )
     if reff_saved:
         archive_saved_reff, archive_reff_error, _ = _archive_outputs(
@@ -1439,7 +1509,10 @@ def run_reporting_pipeline(
         if raw_calc_error_message:
             print(f"Calc RAW Excel note: {raw_calc_error_message}")
     else:
-        print(f"Calc RAW Excel save skipped: {raw_calc_error_message}")
+        if save_cleansed_workbook:
+            print(f"Calc RAW Excel save skipped: {raw_calc_error_message}")
+        else:
+            print("Calc RAW Excel save skipped: analyze-only mode")
     if archive_saved:
         print(f"Archived outputs: {archive_dir}")
     else:
@@ -1448,6 +1521,42 @@ def run_reporting_pipeline(
         print(f"Saved Reff format Excel: {reff_output_path}")
     else:
         print(f"Reff format save skipped: {reff_error_message}")
+
+
+def run_cleansing_pipeline(
+    input_path: str | Path,
+    curr_year: int | None = None,
+    prev_year: int | None = None,
+) -> Path:
+    pipeline_start = perf_counter()
+    current_year, previous_year = _resolve_comparison_years(curr_year, prev_year)
+    project_root = Path(__file__).resolve().parents[2]
+    input_path = Path(input_path).expanduser().resolve()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = project_root / "output" / f"GMPD RAW_Cleaned_{ts}.xlsx"
+
+    saved, error_message, meta, saved_path = save_html_calc_raw_workbook(
+        output_path,
+        input_path=input_path,
+        curr_year=current_year,
+        prev_year=previous_year,
+    )
+    elapsed = perf_counter() - pipeline_start
+    if not saved:
+        raise RuntimeError(f"Cleansing failed: {error_message}")
+
+    print(
+        "Cleansing prepared: "
+        f"rows_full={meta.get('raw_rows_mtd_html_calc_full', 0)}, "
+        f"rows_engine={meta.get('engine_rows_html_calc', 0)}"
+    )
+    print(f"Total Elapsed: {elapsed:.3f}s")
+    print(f"Saved Cleansed Excel: {saved_path}")
+    if error_message:
+        print(f"Cleansing note: {error_message}")
+    print("Next analyze command:")
+    print(f'python main.py --mode analyze --input-path "{saved_path}"')
+    return saved_path
 
 
 

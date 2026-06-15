@@ -12,8 +12,11 @@ import polars as pl
 
 from src.ingestion import build_html_calc_raw_sheets, read_input_excel, write_output_excel
 
-CACHE_SCHEMA_VERSION = 1
-CACHE_MTD_ONLY = True
+CACHE_SCHEMA_VERSION = 2
+# MTD month/day window is temporarily disabled. Restore the old behavior by
+# setting this back to True and removing the early returns in src.ingestion.
+# CACHE_MTD_ONLY = True
+CACHE_MTD_ONLY = False
 CACHE_PREFERRED_SHEET = "raw"
 
 
@@ -88,8 +91,10 @@ def load_input_frame(
     curr_year: int,
     prev_year: int,
     cache_root: Path,
+    preferred_sheet: str = CACHE_PREFERRED_SHEET,
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
     key = _cache_key(path, curr_year=curr_year, prev_year=prev_year)
+    key["preferred_sheet"] = preferred_sheet
     project_root = cache_root.resolve()
     frame_cache_path, meta_cache_path = _cache_paths(path, cache_root=project_root)
     cached = _load_cache(frame_cache_path, meta_cache_path, key)
@@ -101,7 +106,7 @@ def load_input_frame(
 
     loaded = read_input_excel(
         path,
-        preferred_sheet=CACHE_PREFERRED_SHEET,
+        preferred_sheet=preferred_sheet,
         curr_year=curr_year,
         prev_year=prev_year,
         mtd_only=CACHE_MTD_ONLY,
