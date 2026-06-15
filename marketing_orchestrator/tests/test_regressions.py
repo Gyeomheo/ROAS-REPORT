@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 import polars as pl
 
 import src.ingestion as ingestion
+import src.application.reporting.selectors as selectors
 from src.application.campaign_action_service import enrich_campaign_actions
 from src.application.report_service import _build_run_metadata, _insight_text
 from src.ingestion import _normalize_long_frame, _normalize_wide_engine_frame
@@ -67,23 +68,23 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
     def test_long_engine_frame_applies_ext_revenue_rules_and_gross_orders(self) -> None:
         df = pl.DataFrame(
             {
-                "SUBSIDIARY": ["SEAU", "SEC", "SEAU"],
-                "CHANNEL": ["SEARCH", "SEARCH", "SEARCH"],
-                "DIVISION": ["MX", "MX", "MX"],
-                "PRODUCT": ["S SERIES", "S SERIES", "S SERIES"],
-                "PLATFORM": ["TIKTOK", "GOOGLE", "GOOGLE"],
-                "Year": [2026, 2026, 2026],
-                "PLATFORM_SPEND_USD": ["120.5", "140.0", "90.0"],
-                "PLATFORM_REVENUE_USD": ["450.0", "300.0", "210.0"],
-                "GROSS_REVENUE": ["800.0", "500.0", "999.0"],
-                "PLATFORM_CLICKS": ["80", "100", "50"],
-                "GROSS_ORDERS": ["9", "7", "5"],
+                "SUBSIDIARY": ["SEAU", "SEC", "SEAU", "SEAU"],
+                "CHANNEL": ["SEARCH", "SEARCH", "SEARCH", "SEARCH"],
+                "DIVISION": ["MX", "MX", "MX", "MX"],
+                "PRODUCT": ["S SERIES", "S SERIES", "S SERIES", "S SERIES"],
+                "PLATFORM": ["TIKTOK", "GOOGLE", "GOOGLE", "META"],
+                "Year": [2026, 2026, 2026, 2026],
+                "PLATFORM_SPEND_USD": ["120.5", "140.0", "90.0", "200.0"],
+                "PLATFORM_REVENUE_USD": ["450.0", "300.0", "210.0", "600.0"],
+                "GROSS_REVENUE": ["800.0", "500.0", "999.0", "1100.0"],
+                "PLATFORM_CLICKS": ["80", "100", "50", "70"],
+                "GROSS_ORDERS": ["9", "7", "5", "11"],
             }
         )
 
         normalized = _normalize_long_frame(df)
 
-        self.assertEqual(normalized.height, 3)
+        self.assertEqual(normalized.height, 4)
         rows = {(row["SUBSIDIARY"], row["Spend"]): row for row in normalized.to_dicts()}
 
         tiktok_row = rows[("SEAU", 120.5)]
@@ -101,6 +102,11 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         self.assertEqual(default_row["Revenue"], 210.0)
         self.assertEqual(default_row["Ext Revenue"], 210.0)
         self.assertEqual(default_row["Orders"], 5.0)
+
+        meta_row = rows[("SEAU", 200.0)]
+        self.assertEqual(meta_row["Revenue"], 1100.0)
+        self.assertEqual(meta_row["Ext Revenue"], 1100.0)
+        self.assertEqual(meta_row["Orders"], 11.0)
 
     def test_insight_text_uses_clean_korean_strings(self) -> None:
         row = {
@@ -239,7 +245,7 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
             # Unsupported schema -> force fallback path after bounded attempts.
             return pl.DataFrame({"UNKNOWN_COL": ["x"]})
 
-        with patch("src.ingestion.pl.read_excel", side_effect=_fake_read_excel):
+        with patch("src.ingestion.pl.read_excel", side_effect=_fake_read_polars):
             with patch("src.ingestion.EXCEL_ENGINE_CANDIDATES", ("calamine",)):
                 with self.assertRaises(ValueError):
                     ingestion._read_with_polars(
@@ -253,8 +259,199 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         self.assertTrue(all(call.get("engine") == "calamine" for call in calls))
         self.assertTrue(all("columns" not in call for call in calls))
 
+    def test_issue_candidate_gate_passes_on_roas_yoy_drop(self) -> None:
+        rows = [
+            {
+                "diagnosis_subsidiary": "SEC",
+                "path": {"CHANNEL": "SEARCH", "DIVISION": "MX", "PRODUCT": "S SERIES"},
+                "topic_roas_curr": 0.8,
+                "topic_roas_prev": 1.0,  # -20%
+                "impact_contribution_pct": 0.02,
+            },
+            {
+                "diagnosis_subsidiary": "SEC",
+                "path": {"CHANNEL": "PMAX", "DIVISION": "MX", "PRODUCT": "A SERIES"},
+                "topic_roas_curr": 0.99,
+                "topic_roas_prev": 1.0,  # -1%
+                "impact_contribution_pct": 0.02,
+            },
+        ]
+        result = selectors.top3_by_subsidiary(rows, descending=True, issue_candidate_gate=True)
+        self.assertEqual(len(result["SEC"]), 1)
+        self.assertEqual(result["SEC"][0]["path"]["CHANNEL"], "SEARCH")
+
+    def test_issue_candidate_gate_passes_on_revenue_drop_with_nonnegative_spend_yoy(self) -> None:
+        rows = [
+            {
+                "diagnosis_subsidiary": "SEAU",
+                "path": {"CHANNEL": "SOCIAL", "DIVISION": "MX", "PRODUCT": "S SERIES"},
+                "Revenue_curr_sum": 70.0,
+                "Revenue_prev_sum": 100.0,  # -30%
+                "Spend_curr_sum": 120.0,
+                "Spend_prev_sum": 100.0,  # +20%
+                "impact_contribution_pct": 0.03,
+            }
+        ]
+        result = selectors.top3_by_subsidiary(rows, descending=True, issue_candidate_gate=True)
+        self.assertEqual(len(result["SEAU"]), 1)
+
+    def test_issue_candidate_gate_passes_on_impact_contribution(self) -> None:
+        rows = [
+            {
+                "diagnosis_subsidiary": "SEDA",
+                "path": {"CHANNEL": "SEARCH", "DIVISION": "DA", "PRODUCT": "WASHER"},
+                "impact_contribution_pct": 0.12,
+                "topic_roas_curr": 1.2,
+                "topic_roas_prev": 1.0,
+                "Revenue_curr_sum": 120000.0,
+                "Revenue_prev_sum": 100000.0,
+                "Spend_curr_sum": 50000.0,
+                "Spend_prev_sum": 40000.0,
+                "tag": "NORMAL",
+            },
+            {
+                "diagnosis_subsidiary": "SEDA",
+                "path": {"CHANNEL": "PMAX", "DIVISION": "DA", "PRODUCT": "DRYER"},
+                "impact_contribution_pct": 0.08,
+            },
+        ]
+        result = selectors.top3_by_subsidiary(rows, descending=True, issue_candidate_gate=True)
+        self.assertEqual(len(result["SEDA"]), 1)
+        self.assertEqual(result["SEDA"][0]["path"]["PRODUCT"], "WASHER")
+
+    def test_issue_candidate_gate_excludes_low_vol_rows_even_with_high_impact(self) -> None:
+        rows = [
+            {
+                "diagnosis_subsidiary": "SEC",
+                "path": {"CHANNEL": "SEARCH", "DIVISION": "MX", "PRODUCT": "MX OTHERS"},
+                "impact_contribution_pct": 1.5,
+                "tag": "LOW_VOL",
+                "topic_roas_curr": None,
+                "topic_roas_prev": 30.0,
+                "Revenue_curr_sum": 0.0,
+                "Revenue_prev_sum": 200000.0,
+                "Spend_curr_sum": 0.0,
+                "Spend_prev_sum": 60000.0,
+            }
+        ]
+        result = selectors.top3_by_subsidiary(rows, descending=True, issue_candidate_gate=True)
+        self.assertEqual(len(result["SEC"]), 0)
+
+    def test_choose_subsidiary_mode_uses_issue_threshold(self) -> None:
+        issues_by_sub = {"SEC": [{"topic": "issue"}]}
+        improves_by_sub = {"SEC": [{"topic": "improve"}]}
+        perf_small_drop = {"roas_delta": -0.001}
+        perf_large_drop = {"roas_delta": -0.05}
+
+        with patch("src.application.reporting.selectors.ISSUE_MODE_ROAS_DELTA_THRESHOLD", -0.03):
+            mode_small, selected_small = selectors.choose_subsidiary_mode(
+                "SEC",
+                perf_small_drop,
+                issues_by_sub,
+                improves_by_sub,
+            )
+            mode_large, selected_large = selectors.choose_subsidiary_mode(
+                "SEC",
+                perf_large_drop,
+                issues_by_sub,
+                improves_by_sub,
+            )
+
+        self.assertEqual(mode_small, "IMPROVE")
+        self.assertEqual(selected_small, improves_by_sub["SEC"])
+        self.assertEqual(mode_large, "ISSUE")
+        self.assertEqual(selected_large, issues_by_sub["SEC"])
+
+
+    def test_products_column_infers_new_cn_campaign_codes(self) -> None:
+        df = pl.DataFrame(
+            {
+                "PRODUCT": ["OTHERS", "DA CROSS PRODUCTS", None, "MX OTHERS", "OTHERS", "OTHERS", "OTHERS"],
+                "CAMPAIGN_NAME": [
+                    "SEC_CN~arc_launch",
+                    "SEC_CN~acl_alwayson",
+                    "SEC_CN~ard_promo",
+                    "SEC_CN~jbl_speaker",
+                    "SEC_CN~ebdswp_q2",
+                    "SEC_CN~emvip_sale",
+                    "SEC_CN~qoop_kitchen",
+                ],
+            }
+        )
+
+        enriched = ingestion._create_products_column(df)
+
+        self.assertEqual(
+            enriched["PRODUCTS"].to_list(),
+            [
+                "AIR CONDITIONER",
+                "AIR PURIFIER",
+                "AIR DRESSER/SHOE DRESSER",
+                "HARMAN",
+                "DISHWASHER",
+                "LIFESTYLE TV",
+                "MICROWAVE/OTR/QOOKER",
+            ],
+        )
+
+    def test_products_column_keeps_existing_cn_e_campaign_codes(self) -> None:
+        df = pl.DataFrame(
+            {
+                "PRODUCT": ["OTHERS"],
+                "CAMPAIGN_NAME": ["SEC_CN~Ekrfg_launch"],
+            }
+        )
+
+        enriched = ingestion._create_products_column(df)
+
+        self.assertEqual(enriched["PRODUCTS"].to_list(), ["REFRIGERATOR"])
+
+    def test_products_column_covers_sec_campaign_name_workbook_codes(self) -> None:
+        codes = [
+            "bsmartm", "bsmartp", "ebaclm", "ebaclp", "ebarcm", "ebarcp", "ebardm", "ebardp",
+            "ebcarem", "ebcarep", "ebdocm3", "ebdocp3", "ebdrym", "ebdryp", "ebdswm", "ebdswp",
+            "ebhmkm", "ebhmkp", "ebindm", "ebindp", "ebkchm", "ebkchp", "ebltvm", "ebltvp",
+            "ebmonm", "ebmonp", "ebmvim", "ebmvip", "ebppcm", "ebppcp", "ebprim", "ebprip",
+            "ebps6m", "ebps6p", "ebpz7m1", "ebpz7p1", "ebqoom", "ebqoop", "ebrfgm", "ebrfgp",
+            "ebsubm", "ebsubp", "ebtapm", "ebtapp", "ebttvm", "ebttvp", "ebuhdm", "ebuhdp",
+            "ebvcum", "ebvcup", "ebweam", "ebweap", "ebwpfm", "ebwpfp", "ebwshm", "ebwshp",
+            "ef1h26", "ekacl", "ekarc", "ekard", "ekbud4", "ekcare", "ekdry", "ekdsw",
+            "ekfit", "ekhmk", "ekind", "ekjbl", "ekkch", "ekltv", "ekmni", "ekppc6",
+            "ekpri", "ekpz7", "ekrfg", "eksub", "ekta11", "ekttv", "ekvcu", "ekwat8", "ekwsh",
+        ]
+        df = pl.DataFrame(
+            {
+                "PRODUCT": ["OTHERS"] * len(codes),
+                "CAMPAIGN_NAME": [f"SEC_CN~{code}_BS~x" for code in codes],
+            }
+        )
+
+        enriched = ingestion._create_products_column(df)
+
+        self.assertNotIn("OTHERS", enriched["PRODUCTS"].to_list())
+
+    def test_filter_all_zero_raw_metric_rows_drops_only_zero_activity_rows(self) -> None:
+        metric_columns = list(ingestion.RAW_ZERO_ACTIVITY_METRIC_COLUMNS)
+        df = pl.DataFrame(
+            {
+                "CAMPAIGN_NAME": ["all_zero", "has_spend", "has_parse_error"],
+                **{column: [0, 0, 0] for column in metric_columns},
+            }
+        ).with_columns(
+            pl.when(pl.col("CAMPAIGN_NAME") == "has_spend")
+            .then(pl.lit(12.5))
+            .otherwise(pl.col("PLATFORM_SPEND_USD"))
+            .alias("PLATFORM_SPEND_USD"),
+            pl.when(pl.col("CAMPAIGN_NAME") == "has_parse_error")
+            .then(pl.lit("not-a-number"))
+            .otherwise(pl.col("PLATFORM_REVENUE_USD").cast(pl.Utf8))
+            .alias("PLATFORM_REVENUE_USD"),
+        )
+
+        filtered = ingestion._filter_all_zero_raw_metric_rows(df)
+
+        self.assertEqual(filtered["CAMPAIGN_NAME"].to_list(), ["has_spend", "has_parse_error"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

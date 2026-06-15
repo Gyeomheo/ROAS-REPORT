@@ -47,6 +47,21 @@ RAW_METRIC_MAP: dict[str, str] = {
     "PLATFORM_CLICKS": "Clicks",
     "GROSS_ORDERS": "Orders",
 }
+RAW_ZERO_ACTIVITY_METRIC_COLUMNS: tuple[str, ...] = (
+    "PLATFORM_SPEND_USD",
+    "PLATFORM_IMPRESSIONS",
+    "PLATFORM_CLICKS",
+    "VISITS",
+    "QUALIFY_VISITS",
+    "GROSS_ORDERS",
+    "GROSS_REVENUE",
+    "PLATFORM_TOTAL_CONVERSIONS",
+    "PLATFORM_REVENUE_USD",
+    "META_MOBILE_APP_PURCHASE",
+    "META_WEB_PURCHASE",
+    "PLATFORM_VIDEO_VIEWS",
+    "Ext Revenue",
+)
 METRICS: list[str] = ["Spend", "Revenue", "Clicks", "Orders"]
 OBJECTIVE_CANDIDATES: tuple[str, ...] = ("OBJECTIVE", "Objective", "objective")
 TARGET_OBJECTIVE_VALUE = "CONVERSION"
@@ -242,6 +257,100 @@ _URL_SLUG_TO_PRODUCT: dict[str, str] = {
     "dryers":                       "DRYER",
 }
 
+# CN~[코드] 패턴 (CAMPAIGN_NAME에서 CN~Ekrfg, CN~Ebqoop 같은 패턴 파싱)
+# sec campaign name.xlsx keyword report reverse-traced on 2026-05-07.
+_CAMPAIGN_CN_TO_PRODUCT: dict[str, str] = {
+    "arc": "AIR CONDITIONER",
+    "acl": "AIR PURIFIER",
+    "ard": "AIR DRESSER/SHOE DRESSER",
+    "jbl": "HARMAN",
+    "qoop": "MICROWAVE/OTR/QOOKER",
+    "emvip": "LIFESTYLE TV",
+    "bsmartm": "DA CROSS PRODUCTS",
+    "bsmartp": "DA CROSS PRODUCTS",
+    "ebaclm": "AIR PURIFIER",
+    "ebaclp": "AIR PURIFIER",
+    "ebarcm": "AIR CONDITIONER",
+    "ebarcp": "AIR CONDITIONER",
+    "ebardm": "AIR DRESSER/SHOE DRESSER",
+    "ebardp": "AIR DRESSER/SHOE DRESSER",
+    "ebcarem": "DA CROSS PRODUCTS",
+    "ebcarep": "DA CROSS PRODUCTS",
+    "ebdocm3": "MX CROSS PRODUCTS",
+    "ebdocp3": "MX CROSS PRODUCTS",
+    "ebdrym": "DRYER",
+    "ebdryp": "DRYER",
+    "ebdswm": "DISHWASHER",
+    "ebdswp": "DISHWASHER",
+    "ebhmkm": "HARMAN",
+    "ebhmkp": "HARMAN",
+    "ebindm": "RANGE/COOKER",
+    "ebindp": "RANGE/COOKER",
+    "ebkchm": "REFRIGERATOR",
+    "ebkchp": "REFRIGERATOR",
+    "ebltvm": "LIFESTYLE TV",
+    "ebltvp": "LIFESTYLE TV",
+    "ebmonm": "ESSENTIAL MONITOR",
+    "ebmonp": "ESSENTIAL MONITOR",
+    "ebmvim": "LIFESTYLE TV",
+    "ebmvip": "LIFESTYLE TV",
+    "ebppcm": "NOTEBOOK",
+    "ebppcp": "NOTEBOOK",
+    "ebprim": "PRINTER",
+    "ebprip": "PRINTER",
+    "ebps6m": "S SERIES",
+    "ebps6p": "S SERIES",
+    "ebpz7m1": "Z SERIES",
+    "ebpz7p1": "Z SERIES",
+    "ebqoom": "MICROWAVE/OTR/QOOKER",
+    "ebqoop": "MICROWAVE/OTR/QOOKER",
+    "ebrfgm": "REFRIGERATOR",
+    "ebrfgp": "REFRIGERATOR",
+    "ebsubm": "DA CROSS PRODUCTS",
+    "ebsubp": "DA CROSS PRODUCTS",
+    "ebtapm": "TAB S SERIES",
+    "ebtapp": "TAB S SERIES",
+    "ebttvm": "TV",
+    "ebttvp": "TV",
+    "ebuhdm": "TV",
+    "ebuhdp": "TV",
+    "ebvcum": "ROBOT VACUUM",
+    "ebvcup": "ROBOT VACUUM",
+    "ebweam": "MX OTHERS",
+    "ebweap": "MX OTHERS",
+    "ebwpfm": "WATER PURIFIER",
+    "ebwpfp": "WATER PURIFIER",
+    "ebwshm": "WASHER",
+    "ebwshp": "WASHER",
+    "ef1h26": "S SERIES",
+    "ekacl": "AIR PURIFIER",
+    "ekarc": "AIR CONDITIONER",
+    "ekard": "AIR DRESSER/SHOE DRESSER",
+    "ekbud4": "BUDS",
+    "ekcare": "DA CROSS PRODUCTS",
+    "ekdry": "DRYER",
+    "ekdsw": "DISHWASHER",
+    "ekfit": "MX OTHERS",
+    "ekhmk": "SOUND DEVICE",
+    "ekind": "RANGE/COOKER",
+    "ekjbl": "HARMAN",
+    "ekkch": "REFRIGERATOR",
+    "ekltv": "LIFESTYLE TV",
+    "ekmni": "LIFESTYLE TV",
+    "ekppc6": "NOTEBOOK",
+    "ekpri": "PRINTER",
+    "ekpz7": "Z SERIES",
+    "ekrfg": "REFRIGERATOR",
+    "eksub": "DA CROSS PRODUCTS",
+    "ekta11": "TAB S SERIES",
+    "ekttv": "TV",
+    "ekvcu": "ROBOT VACUUM",
+    "ekwat8": "WATCH",
+    "ekwsh": "WASHER",
+    "ebuds": "BUDS",
+    "ewatch": "WATCH",
+    "eaisteam": "FAMILYHUB/AI HOME",
+}
 
 def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
     """PRODUCT 우측에 PRODUCTS 열 추가 (원본 PRODUCT 보존).
@@ -251,10 +360,11 @@ def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
       1. MX_FLAGSHIP_S → S SERIES  (S24/S25/S26 포함 시)
       2. MX_FLAGSHIP_Z → Z SERIES
       3. SB~ → _SB_TO_PRODUCT      (단일 제품 고정 매핑)
-      4. SB~ → _SB_TO_CROSS_LABEL  (교차 제품 고정 레이블)
-      5. SB~ ∈ _SB_DIVISION_MULTI  → "{DIVISION} MULTI"
-      6. URL slug → _URL_SLUG_TO_PRODUCT
-      7. fallback → 원본 PRODUCT 그대로
+      4. CN~[코드] → _CAMPAIGN_CN_TO_PRODUCT (CAMPAIGN_NAME 패턴)
+      5. SB~ → _SB_TO_CROSS_LABEL  (교차 제품 고정 레이블)
+      6. SB~ ∈ _SB_DIVISION_MULTI  → "{DIVISION} MULTI"
+      7. URL slug → _URL_SLUG_TO_PRODUCT
+      8. fallback → 원본 PRODUCT 그대로
     """
     if "PRODUCT" not in df.columns:
         return df
@@ -285,7 +395,18 @@ def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
             fz.is_not_null() & fz.str.contains("Z")
         ).then(pl.lit("Z SERIES")).otherwise(pl.lit(None, dtype=pl.Utf8))
 
-    # --- Level 3 ~ 6: SB~ ---
+    # --- Level 3: CN~[코드] (CAMPAIGN_NAME 파싱) ---
+    cn_product = pl.lit(None, dtype=pl.Utf8)
+    if "CAMPAIGN_NAME" in df.columns:
+        cn_code = (
+            pl.col("CAMPAIGN_NAME")
+            .cast(pl.Utf8, strict=False)
+            .str.extract(r"(?i)CN~([a-z0-9]+)", 1)
+            .str.to_lowercase()
+        )
+        cn_product = cn_code.replace(_CAMPAIGN_CN_TO_PRODUCT, default=None)
+
+    # --- Level 4 ~ 7: SB~ ---
     sb_fixed = pl.lit(None, dtype=pl.Utf8)
     sb_cross = pl.lit(None, dtype=pl.Utf8)
     sb_tv = pl.lit(None, dtype=pl.Utf8)
@@ -329,7 +450,7 @@ def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
         url_inferred = slug.replace(_URL_SLUG_TO_PRODUCT, default=None)
 
     # --- Combine & apply ---
-    inferred = pl.coalesce([mx_s, mx_z, sb_fixed, sb_cross, sb_tv, sb_div_multi, url_inferred])
+    inferred = pl.coalesce([mx_s, mx_z, sb_fixed, cn_product, sb_cross, sb_tv, sb_div_multi, url_inferred])
     products_expr = (
         pl.when(is_problem & inferred.is_not_null())
         .then(inferred)
@@ -632,7 +753,7 @@ def _read_raw_input_excel_frame(path: Path, preferred_sheet: str = "raw") -> pl.
     except Exception:
         target_sheet = _select_sheet_name(excel_path, preferred_sheet)
         raw_df = _read_with_openpyxl(excel_path, target_sheet, preferred_sheet)
-    return _standardize_known_columns(raw_df)
+    return _filter_all_zero_raw_metric_rows(_standardize_known_columns(raw_df))
 
 
 def _year_expr(column_name: str) -> pl.Expr:
@@ -667,6 +788,23 @@ def _metric_parse_error_expr(column_name: str) -> pl.Expr:
 
 def _metric_expr(column_name: str) -> pl.Expr:
     return _metric_parsed_expr(column_name).fill_null(0.0).alias(column_name)
+
+
+def _metric_has_activity_expr(column_name: str) -> pl.Expr:
+    text_expr = _metric_text_expr(column_name)
+    parsed_expr = _metric_parsed_expr(column_name)
+    parse_error = text_expr.is_not_null() & (text_expr != "") & parsed_expr.is_null()
+    return (parsed_expr.fill_null(0.0) != 0.0) | parse_error
+
+
+def _filter_all_zero_raw_metric_rows(df: pl.DataFrame) -> pl.DataFrame:
+    """Drop raw rows where all available activity metrics are zero/blank."""
+    if df.is_empty():
+        return df
+    metric_columns = [column for column in RAW_ZERO_ACTIVITY_METRIC_COLUMNS if column in df.columns]
+    if not metric_columns:
+        return df
+    return df.filter(pl.any_horizontal([_metric_has_activity_expr(column) for column in metric_columns]))
 
 
 def _validate_metric_parse_errors(
@@ -734,9 +872,11 @@ def _ext_revenue_source_expr(columns: Sequence[str]) -> pl.Expr:
     use_sec_revenue = (_normalized_text_expr("SUBSIDIARY") == pl.lit("SEC")).fill_null(False)
     if "PLATFORM" in columns:
         use_tiktok_revenue = _normalized_text_expr("PLATFORM").str.contains("TIKTOK").fill_null(False)
+        use_meta_revenue = _normalized_text_expr("PLATFORM").str.contains("META|FACEBOOK").fill_null(False)
     else:
         use_tiktok_revenue = pl.lit(False)
-    return pl.when(use_sec_revenue | use_tiktok_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
+        use_meta_revenue = pl.lit(False)
+    return pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
 
 
 def _raw_ext_revenue_expr(columns: Sequence[str]) -> pl.Expr:
@@ -756,9 +896,11 @@ def _raw_ext_revenue_expr(columns: Sequence[str]) -> pl.Expr:
         use_sec_revenue = pl.lit(False)
     if "PLATFORM" in columns:
         use_tiktok_revenue = _normalized_text_expr("PLATFORM").str.contains("TIKTOK").fill_null(False)
+        use_meta_revenue = _normalized_text_expr("PLATFORM").str.contains("META|FACEBOOK").fill_null(False)
     else:
         use_tiktok_revenue = pl.lit(False)
-    return pl.when(use_sec_revenue | use_tiktok_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
+        use_meta_revenue = pl.lit(False)
+    return pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
 
 
 def _empty_engine_frame() -> pl.DataFrame:
@@ -911,43 +1053,47 @@ def _apply_mtd_alignment(
     scoped = _filter_target_years(df, curr_year=curr_year, prev_year=prev_year)
     if scoped.is_empty():
         return scoped, meta
-    if "Month" not in scoped.columns:
-        return scoped, meta
+    # MTD month/day window is temporarily disabled.
+    # Restore by uncommenting the block below and removing this return.
+    return scoped, meta
 
-    curr_scope = scoped.filter(pl.col("Year") == curr_year)
-    if curr_scope.is_empty():
-        return scoped, meta
-
-    max_month = curr_scope.select(pl.col("Month").max()).to_series(0)[0]
-    if max_month is None:
-        return scoped, meta
-
-    meta["mtd_month_start"] = int(max_month)
-    meta["mtd_month_cutoff"] = int(max_month)
-
-    has_day = "Day" in scoped.columns
-    max_day = None
-    if has_day:
-        max_day = (
-            curr_scope.filter(pl.col("Month") == pl.lit(max_month))
-            .select(pl.col("Day").max())
-            .to_series(0)[0]
-        )
-        if max_day is not None:
-            meta["mtd_day_start"] = 1
-            meta["mtd_day_cutoff"] = int(max_day)
-
-    if has_day and max_day is not None:
-        in_window = (
-            (pl.col("Month") == pl.lit(max_month))
-            & (pl.col("Day") >= pl.lit(1))
-            & (pl.col("Day") <= pl.lit(max_day))
-        )
-    else:
-        in_window = pl.col("Month") == pl.lit(max_month)
-
-    meta["mtd_applied"] = True
-    return scoped.filter(in_window), meta
+    # if "Month" not in scoped.columns:
+    #     return scoped, meta
+    #
+    # curr_scope = scoped.filter(pl.col("Year") == curr_year)
+    # if curr_scope.is_empty():
+    #     return scoped, meta
+    #
+    # max_month = curr_scope.select(pl.col("Month").max()).to_series(0)[0]
+    # if max_month is None:
+    #     return scoped, meta
+    #
+    # meta["mtd_month_start"] = int(max_month)
+    # meta["mtd_month_cutoff"] = int(max_month)
+    #
+    # has_day = "Day" in scoped.columns
+    # max_day = None
+    # if has_day:
+    #     max_day = (
+    #         curr_scope.filter(pl.col("Month") == pl.lit(max_month))
+    #         .select(pl.col("Day").max())
+    #         .to_series(0)[0]
+    #     )
+    #     if max_day is not None:
+    #         meta["mtd_day_start"] = 1
+    #         meta["mtd_day_cutoff"] = int(max_day)
+    #
+    # if has_day and max_day is not None:
+    #     in_window = (
+    #         (pl.col("Month") == pl.lit(max_month))
+    #         & (pl.col("Day") >= pl.lit(1))
+    #         & (pl.col("Day") <= pl.lit(max_day))
+    #     )
+    # else:
+    #     in_window = pl.col("Month") == pl.lit(max_month)
+    #
+    # meta["mtd_applied"] = True
+    # return scoped.filter(in_window), meta
 
 
 def _pivot_long_to_engine(df: pl.DataFrame, curr_year: int, prev_year: int) -> pl.DataFrame:
@@ -1021,54 +1167,58 @@ def _filter_raw_frame_for_html_window(
         return df, meta
 
     scoped = df.with_columns(_year_expr(year_column).alias("__calc_year")).filter(pl.col("__calc_year").is_in([curr_year, prev_year]))
-    if not mtd_only:
-        return scoped.drop("__calc_year"), meta
+    # MTD month/day window is temporarily disabled for RAW calc output as well.
+    # Restore by uncommenting the block below and removing this return.
+    return scoped.drop("__calc_year"), meta
 
-    month_column = "Month" if "Month" in scoped.columns else "MONTH" if "MONTH" in scoped.columns else None
-    if month_column is None:
-        return scoped.drop("__calc_year"), meta
-
-    scoped = scoped.with_columns(_int_expr(month_column).alias("__calc_month"))
-    curr_scope = scoped.filter(pl.col("__calc_year") == curr_year)
-    if curr_scope.is_empty():
-        drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
-        return scoped.drop(*drop_columns), meta
-
-    max_month = curr_scope.select(pl.col("__calc_month").max()).to_series(0)[0]
-    if max_month is None:
-        drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
-        return scoped.drop(*drop_columns), meta
-
-    meta["mtd_month_start"] = int(max_month)
-    meta["mtd_month_cutoff"] = int(max_month)
-
-    day_column = "Day" if "Day" in scoped.columns else "DAY" if "DAY" in scoped.columns else None
-    max_day = None
-    if day_column is not None:
-        scoped = scoped.with_columns(_int_expr(day_column).alias("__calc_day"))
-        max_day = (
-            curr_scope.with_columns(_int_expr(day_column).alias("__calc_day"))
-            .filter(pl.col("__calc_month") == pl.lit(max_month))
-            .select(pl.col("__calc_day").max())
-            .to_series(0)[0]
-        )
-        if max_day is not None:
-            meta["mtd_day_start"] = 1
-            meta["mtd_day_cutoff"] = int(max_day)
-
-    if day_column is not None and max_day is not None:
-        in_window = (
-            (pl.col("__calc_month") == pl.lit(max_month))
-            & (pl.col("__calc_day") >= pl.lit(1))
-            & (pl.col("__calc_day") <= pl.lit(max_day))
-        )
-    else:
-        in_window = pl.col("__calc_month") == pl.lit(max_month)
-
-    filtered = scoped.filter(in_window)
-    meta["mtd_applied"] = True
-    drop_columns = [column for column in ["__calc_year", "__calc_month", "__calc_day"] if column in filtered.columns]
-    return filtered.drop(*drop_columns), meta
+    # if not mtd_only:
+    #     return scoped.drop("__calc_year"), meta
+    #
+    # month_column = "Month" if "Month" in scoped.columns else "MONTH" if "MONTH" in scoped.columns else None
+    # if month_column is None:
+    #     return scoped.drop("__calc_year"), meta
+    #
+    # scoped = scoped.with_columns(_int_expr(month_column).alias("__calc_month"))
+    # curr_scope = scoped.filter(pl.col("__calc_year") == curr_year)
+    # if curr_scope.is_empty():
+    #     drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
+    #     return scoped.drop(*drop_columns), meta
+    #
+    # max_month = curr_scope.select(pl.col("__calc_month").max()).to_series(0)[0]
+    # if max_month is None:
+    #     drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
+    #     return scoped.drop(*drop_columns), meta
+    #
+    # meta["mtd_month_start"] = int(max_month)
+    # meta["mtd_month_cutoff"] = int(max_month)
+    #
+    # day_column = "Day" if "Day" in scoped.columns else "DAY" if "DAY" in scoped.columns else None
+    # max_day = None
+    # if day_column is not None:
+    #     scoped = scoped.with_columns(_int_expr(day_column).alias("__calc_day"))
+    #     max_day = (
+    #         curr_scope.with_columns(_int_expr(day_column).alias("__calc_day"))
+    #         .filter(pl.col("__calc_month") == pl.lit(max_month))
+    #         .select(pl.col("__calc_day").max())
+    #         .to_series(0)[0]
+    #     )
+    #     if max_day is not None:
+    #         meta["mtd_day_start"] = 1
+    #         meta["mtd_day_cutoff"] = int(max_day)
+    #
+    # if day_column is not None and max_day is not None:
+    #     in_window = (
+    #         (pl.col("__calc_month") == pl.lit(max_month))
+    #         & (pl.col("__calc_day") >= pl.lit(1))
+    #         & (pl.col("__calc_day") <= pl.lit(max_day))
+    #     )
+    # else:
+    #     in_window = pl.col("__calc_month") == pl.lit(max_month)
+    #
+    # filtered = scoped.filter(in_window)
+    # meta["mtd_applied"] = True
+    # drop_columns = [column for column in ["__calc_year", "__calc_month", "__calc_day"] if column in filtered.columns]
+    # return filtered.drop(*drop_columns), meta
 
 
 def build_html_calc_raw_sheets(
@@ -1085,6 +1235,7 @@ def build_html_calc_raw_sheets(
     else:
         raw_df = _read_raw_input_excel_frame(source_path, preferred_sheet=preferred_sheet)
         _save_raw_parquet(raw_df, raw_parquet)
+    raw_df = _filter_all_zero_raw_metric_rows(raw_df)
 
     filtered_objective_df, objective_meta = _filter_conversion_objective(raw_df)
     scoped_df, division_meta = _filter_target_divisions(filtered_objective_df)
@@ -1213,9 +1364,10 @@ def _write_with_polars(path: Path, sheets: Dict[str, pl.DataFrame]) -> bool:
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # constant_memory=True: 행 단위 스트리밍, 작성 후 메모리 해제 → 대형 시트에서 ~2배 추가 가속.
-        # 제약: 셀 역참조/재작성 불가, 시트 간 순차 작성만 가능. polars write_excel은 순차 작성이므로 호환.
-        with xlsxwriter.Workbook(str(path), {"constant_memory": True}) as workbook:
+        # NOTE: constant_memory=True는 polars write_excel()과 비호환.
+        # polars가 내부적으로 add_table()을 호출하는데, xlsxwriter constant_memory 모드에서는
+        # add_table()이 미지원이라 경고만 띄우고 데이터 rows를 통째로 누락시킴 → 6KB 빈 파일 생성.
+        with xlsxwriter.Workbook(str(path)) as workbook:
             for sheet_name, frame in sheets.items():
                 safe_name = str(sheet_name)[:31] or "Sheet1"
                 frame.write_excel(
@@ -1251,10 +1403,12 @@ def _write_with_openpyxl(path: Path, sheets: Dict[str, pl.DataFrame]) -> None:
 
 
 def write_output_excel(path: str | Path, sheets: Dict[str, pl.DataFrame]) -> None:
-    """Write output Excel with Polars-first and openpyxl fallback."""
+    """Write output Excel via openpyxl (no auto-hyperlinks).
+
+    NOTE: polars.write_excel() automatically converts "http://" cells to hyperlinks,
+    which hits xlsxwriter's 65,530/sheet limit. openpyxl writes plain text safely.
+    Performance: ~35s for 94k rows (acceptable for automation).
+    """
     excel_path = Path(path)
     excel_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if _write_with_polars(excel_path, sheets):
-        return
     _write_with_openpyxl(excel_path, sheets)

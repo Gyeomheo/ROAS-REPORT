@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List
 
 from src.application.reporting.metrics import safe_pct_change, to_float
+
+ISSUE_MODE_ROAS_DELTA_THRESHOLD = float(os.getenv("ROAS_ISSUE_THRESHOLD", "-0.03"))
+ISSUE_CANDIDATE_ROAS_YOY_THRESHOLD = float(os.getenv("ROAS_ISSUE_MIN_YOY", "-0.15"))
+ISSUE_CANDIDATE_REVENUE_YOY_THRESHOLD = float(os.getenv("REVENUE_ISSUE_MIN_YOY", "-0.20"))
+ISSUE_CANDIDATE_MIN_IMPACT_CONTRIBUTION = float(os.getenv("ROAS_ISSUE_MIN_IMPACT_CONTRIBUTION", "0.10"))
 
 
 def _topic_roas_delta(item: Dict[str, Any]) -> float | None:
@@ -19,10 +25,94 @@ def _topic_roas_delta(item: Dict[str, Any]) -> float | None:
     return to_float(roas_curr) - to_float(roas_prev)
 
 
+def _safe_yoy(curr: Any, prev: Any) -> float | None:
+    if curr is None or prev is None:
+        return None
+    return safe_pct_change(to_float(curr), to_float(prev))
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _topic_roas_yoy(item: Dict[str, Any]) -> float | None:
+    explicit = item.get("roas_yoy")
+    if explicit is not None:
+        return to_float(explicit)
+
+    for curr_key, prev_key in [("topic_roas_curr", "topic_roas_prev"), ("ROAS_curr", "ROAS_prev")]:
+        yoy = _safe_yoy(item.get(curr_key), item.get(prev_key))
+        if yoy is not None:
+            return yoy
+    return None
+
+
+def _revenue_yoy(item: Dict[str, Any]) -> float | None:
+    for key in ["revenue_yoy", "rev_yoy"]:
+        value = item.get(key)
+        if value is not None:
+            return to_float(value)
+    return _safe_yoy(item.get("Revenue_curr_sum"), item.get("Revenue_prev_sum"))
+
+
+def _spend_yoy(item: Dict[str, Any]) -> float | None:
+    value = item.get("spend_yoy")
+    if value is not None:
+        return to_float(value)
+    return _safe_yoy(item.get("Spend_curr_sum"), item.get("Spend_prev_sum"))
+
+
+def _passes_issue_candidate_gate(item: Dict[str, Any]) -> bool:
+    tag = str(item.get("tag", "") or "").upper()
+    if tag in {"NEW", "LOW_VOL", "GONE", "UNDEFINED"}:
+        return False
+
+    roas_yoy = _topic_roas_yoy(item)
+    revenue_yoy = _revenue_yoy(item)
+    spend_yoy = _spend_yoy(item)
+    impact = item.get("impact_contribution_pct")
+
+    topic_roas_curr = item.get("topic_roas_curr", item.get("ROAS_curr"))
+    topic_roas_prev = item.get("topic_roas_prev", item.get("ROAS_prev"))
+    has_valid_roas_base = (
+        topic_roas_curr is not None
+        and topic_roas_prev is not None
+        and to_float(topic_roas_prev) > 0
+    )
+
+    revenue_curr = _optional_float(item.get("Revenue_curr_sum"))
+    spend_curr = _optional_float(item.get("Spend_curr_sum"))
+    has_current_activity = (
+        (revenue_curr is not None and revenue_curr > 0)
+        or (spend_curr is not None and spend_curr > 0)
+    )
+
+    has_roas_drop = roas_yoy is not None and roas_yoy <= ISSUE_CANDIDATE_ROAS_YOY_THRESHOLD
+    has_revenue_drop_with_nonnegative_spend = (
+        revenue_yoy is not None
+        and spend_yoy is not None
+        and revenue_yoy <= ISSUE_CANDIDATE_REVENUE_YOY_THRESHOLD
+        and spend_yoy >= 0
+    )
+    has_minimum_impact_contribution = (
+        impact is not None
+        and to_float(impact) >= ISSUE_CANDIDATE_MIN_IMPACT_CONTRIBUTION
+        and has_valid_roas_base
+        and has_current_activity
+    )
+    return has_roas_drop or has_revenue_drop_with_nonnegative_spend or has_minimum_impact_contribution
+
+
 def top3_by_subsidiary(
     rows: List[Dict[str, Any]],
     descending: bool,
     min_topic_roas_abs_delta: float = 0.03,
+    issue_candidate_gate: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -67,6 +157,8 @@ def top3_by_subsidiary(
             return False
 
         def _is_actionable(item: Dict[str, Any]) -> bool:
+            if issue_candidate_gate:
+                return _passes_issue_candidate_gate(item)
             roas_delta = _topic_roas_delta(item)
             if roas_delta is None:
                 return _has_yoy_basis(item)
@@ -135,7 +227,7 @@ def choose_subsidiary_mode(
     issues = issues_by_sub.get(subsidiary, [])
     improves = improves_by_sub.get(subsidiary, [])
 
-    if roas_delta_value < 0:
+    if roas_delta_value < ISSUE_MODE_ROAS_DELTA_THRESHOLD:
         if issues:
             return "ISSUE", issues
         return "IMPROVE", improves
