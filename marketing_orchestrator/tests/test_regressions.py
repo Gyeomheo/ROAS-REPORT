@@ -108,6 +108,29 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         self.assertEqual(meta_row["Ext Revenue"], 1100.0)
         self.assertEqual(meta_row["Orders"], 11.0)
 
+    def test_raw_cleansing_window_preserves_non_comparison_years(self) -> None:
+        df = pl.DataFrame(
+            {
+                "SUBSIDIARY": ["SEAU", "SEAU", "SEAU"],
+                "CHANNEL": ["SEARCH", "SEARCH", "SEARCH"],
+                "DIVISION": ["MX", "MX", "MX"],
+                "PRODUCT": ["S SERIES", "S SERIES", "S SERIES"],
+                "Year": [2024, 2025, 2026],
+                "PLATFORM_SPEND_USD": [10.0, 20.0, 30.0],
+            }
+        )
+
+        filtered, meta = ingestion._filter_raw_frame_for_html_window(
+            df,
+            curr_year=2026,
+            prev_year=2025,
+            mtd_only=False,
+        )
+
+        self.assertEqual(filtered.height, 3)
+        self.assertEqual(filtered.get_column("Year").to_list(), [2024, 2025, 2026])
+        self.assertFalse(meta["raw_year_filter_applied"])
+
     def test_insight_text_uses_clean_korean_strings(self) -> None:
         row = {
             "SUBSIDIARY": "SEAU",
@@ -392,6 +415,58 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
                 "LIFESTYLE TV",
                 "MICROWAVE/OTR/QOOKER",
             ],
+        )
+
+    def test_products_column_maps_tq_festival_and_new_cn_codes(self) -> None:
+        df = pl.DataFrame(
+            {
+                "PRODUCT": ["OTHERS", "OTHERS", "OTHERS", "OTHERS", "OTHERS", "OTHERS", "OTHERS"],
+                "CAMPAIGN_NAME": [
+                    "CN~Ekstf_BS~da_SC~SSF_FS~lod2c",
+                    "CN~Etq-ce-c_BS~da_PH~laun_OB~conv_FS~lod2c_FF~kkm",
+                    "CN~Etq-c_BS~cr_PH~laun_OB~conv_FS~lod2c_FF~kkm",
+                    "CN~Etq-mx-c_BS~mx_PH~laun_OB~conv_FS~lod2c_FF~kkm",
+                    "CN~Eksyarc_BS~da_FS~lod2c",
+                    "CN~kkaofampf-c_BS~cr_PH~on_OB~conv_FS~lod2c_FF~kkp",
+                    "CN~Ekpa37_BS~mx_FS~lod2c",
+                ],
+            }
+        )
+
+        enriched = ingestion._create_products_column(df)
+
+        self.assertEqual(
+            enriched["PRODUCTS"].to_list(),
+            [
+                "STICK VACUUM",
+                "DA CROSS PRODUCTS",
+                "CROSS PRODUCTS",
+                "MX CROSS PRODUCTS",
+                "AIR CONDITIONER",
+                "CROSS PRODUCTS",
+                "A SERIES",
+            ],
+        )
+
+    def test_products_column_accepts_campaign_code_separator_variants(self) -> None:
+        df = pl.DataFrame(
+            {
+                "PRODUCT": ["OTHERS", "OTHERS", "OTHERS", "OTHERS"],
+                "DIVISION": ["DA", "DA", "MX", "VD"],
+                "CAMPAIGN_NAME": [
+                    "SEC_CN_Ekrfg_launch",
+                    "SEC-CN-Ebdswp-launch",
+                    "SEC SB-wearsmart alwayson",
+                    "SEC_SB_tv_launch",
+                ],
+            }
+        )
+
+        enriched = ingestion._create_products_column(df)
+
+        self.assertEqual(
+            enriched["PRODUCTS"].to_list(),
+            ["REFRIGERATOR", "DISHWASHER", "WATCH", "TV OTHERS"],
         )
 
     def test_products_column_keeps_existing_cn_e_campaign_codes(self) -> None:
