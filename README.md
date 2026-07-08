@@ -201,9 +201,37 @@ marketing_orchestrator/
 ### 클렌징만 실행
 
 1. 파일 선택창 또는 `--input-path`로 원본 Excel 로드
-2. 스키마 정규화(wide/long 자동 감지), OBJECTIVE/DIVISION 필터, 제품명 보정
-3. 분석용 `engine_html_input` 시트와 검수용 raw 시트를 생성
-4. `output/GMPD RAW_Cleaned_YYYYMMDD_HHMMSS.xlsx` 저장
+2. Polars 우선으로 원본을 읽고, 실패 시 openpyxl fallback으로 헤더/시트를 재탐색
+3. OBJECTIVE=`CONVERSION`, DIVISION=`MX/VD/DA`, all-zero metric row 제거 등 기본 품질 필터 적용
+4. `PRODUCT`가 NULL/OTHERS/CROSS PRODUCTS류이면 `CAMPAIGN_NAME`, flagship 컬럼, landing URL을 이용해 `PRODUCTS` 보강
+5. 검수용 raw full 시트는 curr/prev 연도와 무관하게 전체 기간을 보존
+6. 분석용 `engine_html_input`만 curr/prev 비교연도 기준으로 wide schema 생성
+7. `output/GMPD RAW_Cleaned_YYYYMMDD_HHMMSS.xlsx` 저장
+
+클렌징 산출물의 핵심 시트:
+- `raw_mtd_html_calc_full`: 원본 `PRODUCT`와 추론 `PRODUCTS`를 함께 보존하는 검수용 raw full 시트. curr/prev 연도 필터를 적용하지 않습니다.
+- `raw_mtd_html_calc`: 분석 정규화에 사용한 long-form 중간 산출물.
+- `engine_html_input`: 이후 `main.py --mode analyze`가 바로 읽을 수 있는 curr/prev 비교용 wide schema.
+- `meta`: 적용 필터, row count, source format, raw year filter 여부 등 실행 메타데이터.
+
+PRODUCTS 보강 우선순위:
+1. `MX_FLAGSHIP_S/Z`에서 S/Z series 판정
+2. `CAMPAIGN_NAME`의 `SB~...` 단일 제품 매핑
+3. `CAMPAIGN_NAME`의 `CN~...` 코드 매핑
+4. `SB~...` cross/multi label 매핑
+5. `PLATFORM_LANDING_PAGE_URL` slug 매핑
+6. 추론 불가 시 원본 `PRODUCT` 유지
+
+최근 보강된 CN 코드 예:
+- `Ekstf -> STICK VACUUM`
+- `Eksyarc -> AIR CONDITIONER`
+- `Ekpa37 -> A SERIES`
+- `Etq-ce-c -> DA CROSS PRODUCTS`
+- `Etq-c -> CROSS PRODUCTS`
+- `Etq-mx-c -> MX CROSS PRODUCTS`
+- `kkaofampf-c -> CROSS PRODUCTS`
+
+CN/SB 파서는 `CN~code`, `CN_code`, `CN-code`, `SB~code`, `SB_code`, `SB-code` 형태를 모두 허용합니다. 하이픈이 있는 CN code는 full code를 먼저 매핑하고, 실패 시 첫 하이픈 앞 토큰으로 fallback합니다.
 
 ### 이슈분석만 실행
 
@@ -241,8 +269,10 @@ marketing_orchestrator/
 ### D. 자동 필터 정책
 - OBJECTIVE: `CONVERSION`만 사용
 - DIVISION: `MX`, `VD`, `DA`만 사용
-- 연도: 비교 2개 연도(`curr_year`, `prev_year`)
-- MTD: 현재연도 최대 월의 1일~최대일 기준으로, 과거연도도 동일 월/일 컷오프 정렬
+- all-zero raw metric row는 클렌징 입력에서 제거
+- 클렌징 raw full 시트: curr/prev와 무관하게 전체 기간 보존
+- 분석용 engine 시트: 비교 2개 연도(`curr_year`, `prev_year`) 기준으로 `*_curr`, `*_prev` 생성
+- MTD 월/일 컷오프는 현재 비활성화되어 있으며, `CACHE_MTD_ONLY=False` 기준으로 전체 비교연도 데이터를 사용
 
 ## 7) 실행 방법
 
