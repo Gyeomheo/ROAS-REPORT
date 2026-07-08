@@ -350,7 +350,27 @@ _CAMPAIGN_CN_TO_PRODUCT: dict[str, str] = {
     "ebuds": "BUDS",
     "ewatch": "WATCH",
     "eaisteam": "FAMILYHUB/AI HOME",
+    "ekstf": "STICK VACUUM",
+    "eksyarc": "AIR CONDITIONER",
+    "ekpa37": "A SERIES",
+    "etq-c": "CROSS PRODUCTS",
+    "etq-ce-c": "DA CROSS PRODUCTS",
+    "etq-mx-c": "MX CROSS PRODUCTS",
+    "kkaofampf-c": "CROSS PRODUCTS",
 }
+
+_CAMPAIGN_CODE_PREFIX = r"(?i)(?:^|[^a-z0-9])"
+_CAMPAIGN_CODE_SEPARATOR = r"\s*[~_-]\s*"
+
+
+def _campaign_code_expr(column_name: str, prefix: str, code_pattern: str = r"([a-z0-9]+)") -> pl.Expr:
+    return (
+        pl.col(column_name)
+        .cast(pl.Utf8, strict=False)
+        .str.extract(f"{_CAMPAIGN_CODE_PREFIX}{prefix}{_CAMPAIGN_CODE_SEPARATOR}{code_pattern}", 1)
+        .str.to_lowercase()
+    )
+
 
 def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
     """PRODUCT 우측에 PRODUCTS 열 추가 (원본 PRODUCT 보존).
@@ -398,13 +418,11 @@ def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
     # --- Level 3: CN~[코드] (CAMPAIGN_NAME 파싱) ---
     cn_product = pl.lit(None, dtype=pl.Utf8)
     if "CAMPAIGN_NAME" in df.columns:
-        cn_code = (
-            pl.col("CAMPAIGN_NAME")
-            .cast(pl.Utf8, strict=False)
-            .str.extract(r"(?i)CN~([a-z0-9]+)", 1)
-            .str.to_lowercase()
-        )
-        cn_product = cn_code.replace(_CAMPAIGN_CN_TO_PRODUCT, default=None)
+        cn_code = _campaign_code_expr("CAMPAIGN_NAME", "CN", r"([^_~\s]+)")
+        cn_product = pl.coalesce([
+            cn_code.replace(_CAMPAIGN_CN_TO_PRODUCT, default=None),
+            cn_code.str.split("-").list.first().replace(_CAMPAIGN_CN_TO_PRODUCT, default=None),
+        ])
 
     # --- Level 4 ~ 7: SB~ ---
     sb_fixed = pl.lit(None, dtype=pl.Utf8)
@@ -412,12 +430,7 @@ def _create_products_column(df: pl.DataFrame) -> pl.DataFrame:
     sb_tv = pl.lit(None, dtype=pl.Utf8)
     sb_div_multi = pl.lit(None, dtype=pl.Utf8)
     if "CAMPAIGN_NAME" in df.columns:
-        sb_code = (
-            pl.col("CAMPAIGN_NAME")
-            .cast(pl.Utf8, strict=False)
-            .str.extract(r"(?i)SB~([^_~\s]+)", 1)
-            .str.to_lowercase()
-        )
+        sb_code = _campaign_code_expr("CAMPAIGN_NAME", "SB", r"([^_~\-\s]+)")
         sb_fixed = sb_code.replace(_SB_TO_PRODUCT, default=None)
         sb_cross = sb_code.replace(_SB_TO_CROSS_LABEL, default=None)
 
@@ -1161,64 +1174,15 @@ def _filter_raw_frame_for_html_window(
         "curr_year": curr_year,
         "prev_year": prev_year,
         "mtd_applied": False,
+        "raw_year_filter_applied": False,
     }
     year_column = "Year" if "Year" in df.columns else "YEAR" if "YEAR" in df.columns else None
     if year_column is None:
         return df, meta
 
-    scoped = df.with_columns(_year_expr(year_column).alias("__calc_year")).filter(pl.col("__calc_year").is_in([curr_year, prev_year]))
-    # MTD month/day window is temporarily disabled for RAW calc output as well.
-    # Restore by uncommenting the block below and removing this return.
-    return scoped.drop("__calc_year"), meta
-
-    # if not mtd_only:
-    #     return scoped.drop("__calc_year"), meta
-    #
-    # month_column = "Month" if "Month" in scoped.columns else "MONTH" if "MONTH" in scoped.columns else None
-    # if month_column is None:
-    #     return scoped.drop("__calc_year"), meta
-    #
-    # scoped = scoped.with_columns(_int_expr(month_column).alias("__calc_month"))
-    # curr_scope = scoped.filter(pl.col("__calc_year") == curr_year)
-    # if curr_scope.is_empty():
-    #     drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
-    #     return scoped.drop(*drop_columns), meta
-    #
-    # max_month = curr_scope.select(pl.col("__calc_month").max()).to_series(0)[0]
-    # if max_month is None:
-    #     drop_columns = [column for column in ["__calc_year", "__calc_month"] if column in scoped.columns]
-    #     return scoped.drop(*drop_columns), meta
-    #
-    # meta["mtd_month_start"] = int(max_month)
-    # meta["mtd_month_cutoff"] = int(max_month)
-    #
-    # day_column = "Day" if "Day" in scoped.columns else "DAY" if "DAY" in scoped.columns else None
-    # max_day = None
-    # if day_column is not None:
-    #     scoped = scoped.with_columns(_int_expr(day_column).alias("__calc_day"))
-    #     max_day = (
-    #         curr_scope.with_columns(_int_expr(day_column).alias("__calc_day"))
-    #         .filter(pl.col("__calc_month") == pl.lit(max_month))
-    #         .select(pl.col("__calc_day").max())
-    #         .to_series(0)[0]
-    #     )
-    #     if max_day is not None:
-    #         meta["mtd_day_start"] = 1
-    #         meta["mtd_day_cutoff"] = int(max_day)
-    #
-    # if day_column is not None and max_day is not None:
-    #     in_window = (
-    #         (pl.col("__calc_month") == pl.lit(max_month))
-    #         & (pl.col("__calc_day") >= pl.lit(1))
-    #         & (pl.col("__calc_day") <= pl.lit(max_day))
-    #     )
-    # else:
-    #     in_window = pl.col("__calc_month") == pl.lit(max_month)
-    #
-    # filtered = scoped.filter(in_window)
-    # meta["mtd_applied"] = True
-    # drop_columns = [column for column in ["__calc_year", "__calc_month", "__calc_day"] if column in filtered.columns]
-    # return filtered.drop(*drop_columns), meta
+    # RAW_Cleaned should preserve all source periods. curr/prev years are only
+    # used for the analysis engine comparison columns.
+    return df, meta
 
 
 def build_html_calc_raw_sheets(
