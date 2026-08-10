@@ -39,8 +39,8 @@ def sum_aggregations_full() -> list[pl.Expr]:
         pl.col("Spend_prev").sum().alias("Spend_prev_sum"),
         pl.col("Clicks_curr").sum().alias("Clicks_curr_sum"),
         pl.col("Clicks_prev").sum().alias("Clicks_prev_sum"),
-        pl.col("Orders_curr").sum().alias("Orders_curr_sum"),
-        pl.col("Orders_prev").sum().alias("Orders_prev_sum"),
+        pl.col("Gross Orders_curr").sum().alias("Gross Orders_curr_sum"),
+        pl.col("Gross Orders_prev").sum().alias("Gross Orders_prev_sum"),
     ]
 
 

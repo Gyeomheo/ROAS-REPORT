@@ -18,8 +18,8 @@ class RootCauseEngine:
         "Revenue_prev",
         "Clicks_curr",
         "Clicks_prev",
-        "Orders_curr",
-        "Orders_prev",
+        "Gross Orders_curr",
+        "Gross Orders_prev",
     ]
     SUM_METRICS: List[str] = [
         "Revenue_curr_sum",
@@ -28,8 +28,8 @@ class RootCauseEngine:
         "Spend_prev_sum",
         "Clicks_curr_sum",
         "Clicks_prev_sum",
-        "Orders_curr_sum",
-        "Orders_prev_sum",
+        "Gross Orders_curr_sum",
+        "Gross Orders_prev_sum",
     ]
     RCA_FIELDS: List[str] = [
         "primary_driver",
@@ -85,8 +85,8 @@ class RootCauseEngine:
             pl.col("Spend_prev").sum().alias("Spend_prev_sum"),
             pl.col("Clicks_curr").sum().alias("Clicks_curr_sum"),
             pl.col("Clicks_prev").sum().alias("Clicks_prev_sum"),
-            pl.col("Orders_curr").sum().alias("Orders_curr_sum"),
-            pl.col("Orders_prev").sum().alias("Orders_prev_sum"),
+            pl.col("Gross Orders_curr").sum().alias("Gross Orders_curr_sum"),
+            pl.col("Gross Orders_prev").sum().alias("Gross Orders_prev_sum"),
         ]
 
     def _aggregate_campaign(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -153,10 +153,10 @@ class RootCauseEngine:
                 [
                     self._safe_ratio_expr(pl.col("Spend_curr_sum"), pl.col("Clicks_curr_sum")).alias("CPC_curr"),
                     self._safe_ratio_expr(pl.col("Spend_prev_sum"), pl.col("Clicks_prev_sum")).alias("CPC_prev"),
-                    self._safe_ratio_expr(pl.col("Orders_curr_sum"), pl.col("Clicks_curr_sum")).alias("CVR_curr"),
-                    self._safe_ratio_expr(pl.col("Orders_prev_sum"), pl.col("Clicks_prev_sum")).alias("CVR_prev"),
-                    self._safe_ratio_expr(pl.col("Revenue_curr_sum"), pl.col("Orders_curr_sum")).alias("AOV_curr"),
-                    self._safe_ratio_expr(pl.col("Revenue_prev_sum"), pl.col("Orders_prev_sum")).alias("AOV_prev"),
+                    self._safe_ratio_expr(pl.col("Gross Orders_curr_sum"), pl.col("Clicks_curr_sum")).alias("CVR_curr"),
+                    self._safe_ratio_expr(pl.col("Gross Orders_prev_sum"), pl.col("Clicks_prev_sum")).alias("CVR_prev"),
+                    self._safe_ratio_expr(pl.col("Revenue_curr_sum"), pl.col("Gross Orders_curr_sum")).alias("AOV_curr"),
+                    self._safe_ratio_expr(pl.col("Revenue_prev_sum"), pl.col("Gross Orders_prev_sum")).alias("AOV_prev"),
                     self._safe_ratio_expr(pl.col("Revenue_curr_sum"), pl.col("Spend_curr_sum")).alias("ROAS_curr"),
                     self._safe_ratio_expr(pl.col("Revenue_prev_sum"), pl.col("Spend_prev_sum")).alias("ROAS_prev"),
                 ]
@@ -183,7 +183,7 @@ class RootCauseEngine:
                 .alias("total_dlog_roas")
             )
             .with_columns(
-                pl.when((pl.col("Clicks_curr_sum") < 100) | (pl.col("Orders_curr_sum") < 5))
+                pl.when((pl.col("Clicks_curr_sum") < 100) | (pl.col("Gross Orders_curr_sum") < 5))
                 .then(pl.lit("LOW_VOL"))
                 .when((pl.col("Revenue_prev_sum") == 0) & (pl.col("Revenue_curr_sum") > 0))
                 .then(pl.lit("NEW"))

@@ -242,8 +242,8 @@ def _insight_text(
     division_rev_prev = _to_float(division_row.get("Revenue_prev_sum"))
     division_clicks_curr = _to_float(division_row.get("Clicks_curr_sum"))
     division_clicks_prev = _to_float(division_row.get("Clicks_prev_sum"))
-    division_orders_curr = _to_float(division_row.get("Orders_curr_sum"))
-    division_orders_prev = _to_float(division_row.get("Orders_prev_sum"))
+    division_orders_curr = _to_float(division_row.get("Gross Orders_curr_sum"))
+    division_orders_prev = _to_float(division_row.get("Gross Orders_prev_sum"))
     division_spend_yoy = _safe_pct_change(division_spend_curr, division_spend_prev)
     division_rev_yoy = _safe_pct_change(division_rev_curr, division_rev_prev)
     division_roas_curr = _safe_ratio(division_rev_curr, division_spend_curr)
@@ -307,8 +307,8 @@ def _insight_text(
 
     product_clicks_curr = _to_float(row.get("Clicks_curr_sum"))
     product_clicks_prev = _to_float(row.get("Clicks_prev_sum"))
-    product_orders_curr = _to_float(row.get("Orders_curr_sum"))
-    product_orders_prev = _to_float(row.get("Orders_prev_sum"))
+    product_orders_curr = _to_float(row.get("Gross Orders_curr_sum"))
+    product_orders_prev = _to_float(row.get("Gross Orders_prev_sum"))
 
     product_cpc_curr = row.get("CPC_curr")
     product_cpc_prev = row.get("CPC_prev")
@@ -668,8 +668,8 @@ def _subsidiary_metrics(scope_row: Dict[str, Any]) -> Dict[str, Any]:
     spend_prev = _to_float(scope_row.get("Spend_prev_sum"))
     clicks_curr = _to_float(scope_row.get("Clicks_curr_sum"))
     clicks_prev = _to_float(scope_row.get("Clicks_prev_sum"))
-    orders_curr = _to_float(scope_row.get("Orders_curr_sum"))
-    orders_prev = _to_float(scope_row.get("Orders_prev_sum"))
+    orders_curr = _to_float(scope_row.get("Gross Orders_curr_sum"))
+    orders_prev = _to_float(scope_row.get("Gross Orders_prev_sum"))
 
     cpc_curr = _safe_ratio(spend_curr, clicks_curr)
     cpc_prev = _safe_ratio(spend_prev, clicks_prev)
@@ -1107,8 +1107,8 @@ def _campaign_sheet_df(rows: List[Dict[str, Any]]) -> pl.DataFrame:
         "Spend_prev_sum",
         "Clicks_curr_sum",
         "Clicks_prev_sum",
-        "Orders_curr_sum",
-        "Orders_prev_sum",
+        "Gross Orders_curr_sum",
+        "Gross Orders_prev_sum",
         "Impact_raw",
         "Impact_adj",
         "Share_childsum",

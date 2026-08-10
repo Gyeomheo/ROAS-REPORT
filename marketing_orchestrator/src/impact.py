@@ -18,8 +18,8 @@ class ImpactEngine:
         "Revenue_prev",
         "Clicks_curr",
         "Clicks_prev",
-        "Orders_curr",
-        "Orders_prev",
+        "Gross Orders_curr",
+        "Gross Orders_prev",
     ]
     SUM_METRICS: List[str] = [
         "Revenue_curr_sum",
@@ -28,8 +28,8 @@ class ImpactEngine:
         "Spend_prev_sum",
         "Clicks_curr_sum",
         "Clicks_prev_sum",
-        "Orders_curr_sum",
-        "Orders_prev_sum",
+        "Gross Orders_curr_sum",
+        "Gross Orders_prev_sum",
     ]
     LEVELS: List[List[str]] = [
         ["SUBSIDIARY"],
@@ -142,8 +142,8 @@ class ImpactEngine:
             pl.col("Spend_prev").sum().alias("Spend_prev_sum"),
             pl.col("Clicks_curr").sum().alias("Clicks_curr_sum"),
             pl.col("Clicks_prev").sum().alias("Clicks_prev_sum"),
-            pl.col("Orders_curr").sum().alias("Orders_curr_sum"),
-            pl.col("Orders_prev").sum().alias("Orders_prev_sum"),
+            pl.col("Gross Orders_curr").sum().alias("Gross Orders_curr_sum"),
+            pl.col("Gross Orders_prev").sum().alias("Gross Orders_prev_sum"),
         ]
 
     def _materialize_level_cache(self, df: pl.DataFrame) -> None:
