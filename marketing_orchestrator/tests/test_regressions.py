@@ -56,8 +56,8 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
                 "Revenue_prev": [500.0],
                 "Clicks_curr": [0.0],
                 "Clicks_prev": [100.0],
-                "Orders_curr": [0.0],
-                "Orders_prev": [12.0],
+                "Gross Orders_curr": [0.0],
+                "Gross Orders_prev": [12.0],
             }
         )
 
@@ -66,47 +66,74 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         self.assertEqual(normalized.height, 1)
 
     def test_long_engine_frame_applies_ext_revenue_rules_and_gross_orders(self) -> None:
+        # GROSS_REVENUE_RULES 6케이스.
+        # SOCIAL/DISPLAY 는 CHANNEL, TIKTOK 은 PLATFORM, SEC 는 SUBSIDIARY 로 판정된다
+        # — 세 조건이 서로 다른 열을 본다.
+        #
+        # 조합은 전부 실데이터에 존재하는 것만 쓴다. 특히 META/SEARCH 는 만들지 않는다:
+        # 실측상 META 는 SOCIAL 1399 / DISPLAY 10 / NULL 1 이고 SEARCH 조합은 없다.
+        # (SEARCH 의 PLATFORM 은 GOOGLE ADS / NAVER / BING 뿐)
         df = pl.DataFrame(
             {
-                "SUBSIDIARY": ["SEAU", "SEC", "SEAU", "SEAU"],
-                "CHANNEL": ["SEARCH", "SEARCH", "SEARCH", "SEARCH"],
-                "DIVISION": ["MX", "MX", "MX", "MX"],
-                "PRODUCT": ["S SERIES", "S SERIES", "S SERIES", "S SERIES"],
-                "PLATFORM": ["TIKTOK", "GOOGLE", "GOOGLE", "META"],
-                "Year": [2026, 2026, 2026, 2026],
-                "PLATFORM_SPEND_USD": ["120.5", "140.0", "90.0", "200.0"],
-                "PLATFORM_REVENUE_USD": ["450.0", "300.0", "210.0", "600.0"],
-                "GROSS_REVENUE": ["800.0", "500.0", "999.0", "1100.0"],
-                "PLATFORM_CLICKS": ["80", "100", "50", "70"],
-                "GROSS_ORDERS": ["9", "7", "5", "11"],
+                "SUBSIDIARY": ["SEAU", "SEC", "SEAU", "SEAU", "SEAU", "SEAU"],
+                "CHANNEL": ["SOCIAL", "SEARCH", "SEARCH", "SEARCH", "SOCIAL", "DISPLAY"],
+                "DIVISION": ["MX"] * 6,
+                "PRODUCT": ["S SERIES"] * 6,
+                "PLATFORM": ["TIKTOK", "GOOGLE ADS", "GOOGLE ADS", "NAVER", "META", "DV360"],
+                "Year": [2026] * 6,
+                "PLATFORM_SPEND_USD": ["120.5", "140.0", "90.0", "200.0", "250.0", "300.0"],
+                "PLATFORM_REVENUE_USD": ["450.0", "300.0", "210.0", "600.0", "700.0", "900.0"],
+                "GROSS_REVENUE": ["800.0", "500.0", "999.0", "1100.0", "1200.0", "1300.0"],
+                "PLATFORM_CLICKS": ["80", "100", "50", "70", "60", "40"],
+                "GROSS_ORDERS": ["9", "7", "5", "11", "13", "17"],
             }
         )
 
         normalized = _normalize_long_frame(df)
 
-        self.assertEqual(normalized.height, 4)
+        self.assertEqual(normalized.height, 6)
         rows = {(row["SUBSIDIARY"], row["Spend"]): row for row in normalized.to_dicts()}
 
+        # PLATFORM=TIKTOK -> GROSS
         tiktok_row = rows[("SEAU", 120.5)]
         self.assertEqual(tiktok_row["Spend"], 120.5)
         self.assertEqual(tiktok_row["Revenue"], 800.0)
         self.assertEqual(tiktok_row["Ext Revenue"], 800.0)
-        self.assertEqual(tiktok_row["Orders"], 9.0)
+        self.assertEqual(tiktok_row["Gross Orders"], 9.0)
 
+        # SUBSIDIARY=SEC -> GROSS
         sec_row = rows[("SEC", 140.0)]
         self.assertEqual(sec_row["Revenue"], 500.0)
         self.assertEqual(sec_row["Ext Revenue"], 500.0)
-        self.assertEqual(sec_row["Orders"], 7.0)
+        self.assertEqual(sec_row["Gross Orders"], 7.0)
 
+        # 해당 없음(GOOGLE ADS / SEARCH) -> PLATFORM_REVENUE_USD
         default_row = rows[("SEAU", 90.0)]
         self.assertEqual(default_row["Revenue"], 210.0)
         self.assertEqual(default_row["Ext Revenue"], 210.0)
-        self.assertEqual(default_row["Orders"], 5.0)
+        self.assertEqual(default_row["Gross Orders"], 5.0)
 
-        meta_row = rows[("SEAU", 200.0)]
-        self.assertEqual(meta_row["Revenue"], 1100.0)
-        self.assertEqual(meta_row["Ext Revenue"], 1100.0)
-        self.assertEqual(meta_row["Orders"], 11.0)
+        # 해당 없음(NAVER / SEARCH) -> PLATFORM_REVENUE_USD
+        # 규칙에 없는 플랫폼이 GROSS 로 새지 않는지 확인하는 자리다.
+        naver_row = rows[("SEAU", 200.0)]
+        self.assertEqual(naver_row["Revenue"], 600.0)
+        self.assertEqual(naver_row["Ext Revenue"], 600.0)
+        self.assertEqual(naver_row["Gross Orders"], 11.0)
+
+        # META / SOCIAL -> GROSS. 단 근거가 PLATFORM 특례가 아니라 CHANNEL 이다.
+        # 2026-06-15~08-07 에는 PLATFORM~META 특례로 잡혔는데, 실데이터의 META 는
+        # 전부 SOCIAL/DISPLAY 라 결과값은 같다. 즉 META 조건 제거의 실질 영향은 없고,
+        # 실제 변화는 아래 DISPLAY 케이스(비-META 플랫폼)에서 발생한다.
+        meta_row = rows[("SEAU", 250.0)]
+        self.assertEqual(meta_row["Revenue"], 1200.0)
+        self.assertEqual(meta_row["Ext Revenue"], 1200.0)
+        self.assertEqual(meta_row["Gross Orders"], 13.0)
+
+        # DV360 / DISPLAY -> GROSS. 구 규칙이 통째로 놓치던 구간이며 이번 수정의 실질이다.
+        display_row = rows[("SEAU", 300.0)]
+        self.assertEqual(display_row["Revenue"], 1300.0)
+        self.assertEqual(display_row["Ext Revenue"], 1300.0)
+        self.assertEqual(display_row["Gross Orders"], 17.0)
 
     def test_raw_cleansing_window_preserves_non_comparison_years(self) -> None:
         df = pl.DataFrame(
@@ -146,8 +173,8 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
             "Spend_prev_sum": 124000.0,
             "Clicks_curr_sum": 5000.0,
             "Clicks_prev_sum": 10000.0,
-            "Orders_curr_sum": 35.0,
-            "Orders_prev_sum": 140.0,
+            "Gross Orders_curr_sum": 35.0,
+            "Gross Orders_prev_sum": 140.0,
             "CVR_curr": 0.007,
             "CVR_prev": 0.014,
             "CPC_curr": 12.4,
@@ -176,8 +203,8 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
                 "Revenue_prev_sum": 2900000.0,
                 "Clicks_curr_sum": 7500.0,
                 "Clicks_prev_sum": 16000.0,
-                "Orders_curr_sum": 53.0,
-                "Orders_prev_sum": 390.0,
+                "Gross Orders_curr_sum": 53.0,
+                "Gross Orders_prev_sum": 390.0,
             }
         }
         subsidiary_map = {

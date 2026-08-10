@@ -97,8 +97,8 @@ def _sum_aggs() -> list[pl.Expr]:
         pl.col("Spend_prev").sum().alias("Spend_prev_sum"),
         pl.col("Clicks_curr").sum().alias("Clicks_curr_sum"),
         pl.col("Clicks_prev").sum().alias("Clicks_prev_sum"),
-        pl.col("Orders_curr").sum().alias("Orders_curr_sum"),
-        pl.col("Orders_prev").sum().alias("Orders_prev_sum"),
+        pl.col("Gross Orders_curr").sum().alias("Gross Orders_curr_sum"),
+        pl.col("Gross Orders_prev").sum().alias("Gross Orders_prev_sum"),
     ]
 
 
@@ -109,8 +109,8 @@ def _metric_pack(scope_row: Dict[str, Any]) -> Dict[str, Any]:
     cost_prev = _to_float(scope_row.get("Spend_prev_sum"))
     clicks_curr = _to_float(scope_row.get("Clicks_curr_sum"))
     clicks_prev = _to_float(scope_row.get("Clicks_prev_sum"))
-    orders_curr = _to_float(scope_row.get("Orders_curr_sum"))
-    orders_prev = _to_float(scope_row.get("Orders_prev_sum"))
+    orders_curr = _to_float(scope_row.get("Gross Orders_curr_sum"))
+    orders_prev = _to_float(scope_row.get("Gross Orders_prev_sum"))
 
     roas_curr = _safe_ratio(revenue_curr, cost_curr)
     roas_prev = _safe_ratio(revenue_prev, cost_prev)

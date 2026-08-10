@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import warnings
 from datetime import date
 from pathlib import Path
@@ -45,7 +46,34 @@ RAW_METRIC_MAP: dict[str, str] = {
     "PLATFORM_SPEND_USD": "Spend",
     "PLATFORM_REVENUE_USD": "Revenue",
     "PLATFORM_CLICKS": "Clicks",
-    "GROSS_ORDERS": "Orders",
+    "GROSS_ORDERS": "Gross Orders",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ext Revenue 산출 규칙 — 여기만 고치면 전 경로에 반영된다
+#
+# 매출 열이 둘이라 행마다 무엇을 쓸지 골라야 한다.
+#   GROSS_REVENUE        주문 기준 실매출
+#   PLATFORM_REVENUE_USD 플랫폼이 자기 기여라고 주장하는 매출
+#
+# DISPLAY/SOCIAL과 TikTok은 뷰스루 어트리뷰션 + 긴 룩백윈도우 때문에 플랫폼 주장
+# 매출이 과대 계상된다. 그래서 주문 기준(GROSS)을 쓴다. SEC는 측정 체계가 달라 전량 GROSS.
+# 나머지는 PLATFORM_REVENUE_USD.
+#
+# 주의: 세 조건이 서로 다른 열을 본다. 한 열로 합치려 하지 말 것.
+# 주의: 이 규칙은 자주 바뀐다. 조건을 코드에 직접 추가하지 말고 이 상수만 고치고,
+#       바꿀 때마다 아래 변경 이력에 한 줄 남길 것.
+#
+# 변경 이력
+#   2026-04-08  최초 도입 — TikTok, SEC                                   (b410492)
+#   2026-06-15  META/FACEBOOK 추가 — 일지 기록 없음, SOCIAL 근사였던 것으로 추정 (b487c1f)
+#   2026-08-07  CHANNEL 기준으로 정정 — SOCIAL/DISPLAY 가 META 조건을 대체.
+#               META는 CHANNEL=SOCIAL 의 한 플랫폼일 뿐이라 DISPLAY 전체와
+#               SOCIAL 의 비-META 플랫폼(X/Pinterest/DV360/Criteo)을 놓치고 있었다.
+GROSS_REVENUE_RULES: dict[str, tuple[str, ...]] = {
+    "SUBSIDIARY": ("SEC",),
+    "CHANNEL": ("SOCIAL", "DISPLAY"),
+    "PLATFORM": ("TIKTOK",),
 }
 RAW_ZERO_ACTIVITY_METRIC_COLUMNS: tuple[str, ...] = (
     "PLATFORM_SPEND_USD",
@@ -62,7 +90,7 @@ RAW_ZERO_ACTIVITY_METRIC_COLUMNS: tuple[str, ...] = (
     "PLATFORM_VIDEO_VIEWS",
     "Ext Revenue",
 )
-METRICS: list[str] = ["Spend", "Revenue", "Clicks", "Orders"]
+METRICS: list[str] = ["Spend", "Revenue", "Clicks", "Gross Orders"]
 OBJECTIVE_CANDIDATES: tuple[str, ...] = ("OBJECTIVE", "Objective", "objective")
 TARGET_OBJECTIVE_VALUE = "CONVERSION"
 TARGET_DIVISIONS: tuple[str, ...] = ("MX", "VD", "DA")
@@ -73,8 +101,8 @@ ENGINE_METRIC_COLUMNS: list[str] = [
     "Revenue_prev",
     "Clicks_curr",
     "Clicks_prev",
-    "Orders_curr",
-    "Orders_prev",
+    "Gross Orders_curr",
+    "Gross Orders_prev",
 ]
 ENGINE_COLUMNS: list[str] = [*DIMENSIONS, *ENGINE_METRIC_COLUMNS]
 LONG_COLUMNS_YEAR_WITH_OBJECTIVE: list[str] = [*DIMENSIONS, *RAW_METRIC_MAP.keys(), "OBJECTIVE", "Year", "Month", "Day"]
@@ -146,6 +174,16 @@ SOURCE_RAW_HEADERS: tuple[str, ...] = (
     "PLATFORM_VIDEO_VIEWS",
 )
 SOURCE_HEADER_MAP: dict[str, str] = {header.upper(): header for header in SOURCE_RAW_HEADERS}
+
+# 구버전 산출물 호환 — 2026-08-07 이전에 생성된 GMPD RAW_Cleaned 워크북은 'Orders*' 헤더를 쓴다.
+# main.py --mode analyze 로 과거 파일을 다시 읽을 때 헤더를 새 이름으로 승격시켜,
+# output/ 에 쌓인 기존 파일들이 이름 변경 때문에 못 읽히는 일이 없게 한다.
+LEGACY_HEADER_ALIASES: dict[str, str] = {
+    "ORDERS": "Gross Orders",
+    "ORDERS_CURR": "Gross Orders_curr",
+    "ORDERS_PREV": "Gross Orders_prev",
+}
+SOURCE_HEADER_MAP.update(LEGACY_HEADER_ALIASES)
 SOURCE_HEADER_SCAN_MAX_ROWS = 120
 REQUIRED_LONG_HEADERS_UPPER: set[str] = {
     "YEAR",
@@ -876,44 +914,48 @@ def _normalized_text_expr(column_name: str) -> pl.Expr:
     return pl.col(column_name).cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase()
 
 
-def _ext_revenue_source_expr(columns: Sequence[str]) -> pl.Expr:
-    base_revenue = _metric_parsed_expr("Revenue").fill_null(0.0)
+def _use_gross_revenue_expr(columns: Sequence[str]) -> pl.Expr:
+    """GROSS_REVENUE 를 써야 하는 행인지 판정.
+
+    GROSS_REVENUE_RULES 의 조건 중 하나라도 맞으면 True.
+    없는 열은 조용히 건너뛴다(경로마다 보유 열이 달라서).
+    부분 일치로 본다 — 'TIKTOK ADS' 같은 표기 변형을 흡수하기 위함이며,
+    04-08 최초 구현의 contains 동작을 그대로 유지한 것이다.
+    """
+    condition = pl.lit(False)
+    for column, values in GROSS_REVENUE_RULES.items():
+        if column not in columns or not values:
+            continue
+        pattern = "|".join(re.escape(value) for value in values)
+        condition = condition | _normalized_text_expr(column).str.contains(pattern).fill_null(False)
+    return condition
+
+
+def _ext_revenue_expr(columns: Sequence[str], base_column: str) -> pl.Expr:
+    """Ext Revenue = 규칙에 걸리면 GROSS_REVENUE, 아니면 base_column."""
+    base_revenue = (
+        _metric_parsed_expr(base_column).fill_null(0.0) if base_column in columns else pl.lit(0.0)
+    )
     if "GROSS_REVENUE" not in columns:
         return base_revenue.alias("Ext Revenue")
-
     gross_revenue = _metric_parsed_expr("GROSS_REVENUE").fill_null(0.0)
-    use_sec_revenue = (_normalized_text_expr("SUBSIDIARY") == pl.lit("SEC")).fill_null(False)
-    if "PLATFORM" in columns:
-        use_tiktok_revenue = _normalized_text_expr("PLATFORM").str.contains("TIKTOK").fill_null(False)
-        use_meta_revenue = _normalized_text_expr("PLATFORM").str.contains("META|FACEBOOK").fill_null(False)
-    else:
-        use_tiktok_revenue = pl.lit(False)
-        use_meta_revenue = pl.lit(False)
-    return pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
+    return (
+        pl.when(_use_gross_revenue_expr(columns))
+        .then(gross_revenue)
+        .otherwise(base_revenue)
+        .alias("Ext Revenue")
+    )
+
+
+def _ext_revenue_source_expr(columns: Sequence[str]) -> pl.Expr:
+    """long 경로 — 이미 RAW_METRIC_MAP 으로 rename 된 뒤라 base 는 'Revenue'."""
+    return _ext_revenue_expr(columns, "Revenue")
 
 
 def _raw_ext_revenue_expr(columns: Sequence[str]) -> pl.Expr:
+    """raw 경로 — rename 전이라 원본 열 이름을 그대로 쓴다."""
     base_column = "PLATFORM_REVENUE_USD" if "PLATFORM_REVENUE_USD" in columns else "Revenue"
-    if base_column in columns:
-        base_revenue = _metric_parsed_expr(base_column).fill_null(0.0)
-    else:
-        base_revenue = pl.lit(0.0)
-
-    if "GROSS_REVENUE" not in columns:
-        return base_revenue.alias("Ext Revenue")
-
-    gross_revenue = _metric_parsed_expr("GROSS_REVENUE").fill_null(0.0)
-    if "SUBSIDIARY" in columns:
-        use_sec_revenue = (_normalized_text_expr("SUBSIDIARY") == pl.lit("SEC")).fill_null(False)
-    else:
-        use_sec_revenue = pl.lit(False)
-    if "PLATFORM" in columns:
-        use_tiktok_revenue = _normalized_text_expr("PLATFORM").str.contains("TIKTOK").fill_null(False)
-        use_meta_revenue = _normalized_text_expr("PLATFORM").str.contains("META|FACEBOOK").fill_null(False)
-    else:
-        use_tiktok_revenue = pl.lit(False)
-        use_meta_revenue = pl.lit(False)
-    return pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
+    return _ext_revenue_expr(columns, base_column)
 
 
 def _empty_engine_frame() -> pl.DataFrame:
@@ -1032,7 +1074,7 @@ def _normalize_long_frame(df: pl.DataFrame) -> pl.DataFrame:
 
     exprs = (
         [_dimension_expr(dim) for dim in DIMENSIONS]
-        + [_metric_expr("Spend"), _metric_expr("Clicks"), _metric_expr("Orders"), _ext_revenue_source_expr(selected.columns)]
+        + [_metric_expr("Spend"), _metric_expr("Clicks"), _metric_expr("Gross Orders"), _ext_revenue_source_expr(selected.columns)]
         + [_year_expr(year_column).alias("Year")]
     )
 
