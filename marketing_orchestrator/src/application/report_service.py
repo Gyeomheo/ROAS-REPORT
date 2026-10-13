@@ -1527,13 +1527,15 @@ def run_cleansing_pipeline(
     input_path: str | Path,
     curr_year: int | None = None,
     prev_year: int | None = None,
+    output_dir: str | Path | None = None,
 ) -> Path:
     pipeline_start = perf_counter()
     current_year, previous_year = _resolve_comparison_years(curr_year, prev_year)
-    project_root = Path(__file__).resolve().parents[2]
     input_path = Path(input_path).expanduser().resolve()
+    # 결과는 기본으로 입력 파일과 같은 폴더에 둔다 (2026-10-13 담당자 요청). 회차 폴더에 GMPD 원본과 나란히 쌓인다.
+    target_dir = Path(output_dir).expanduser().resolve() if output_dir is not None else input_path.parent
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = project_root / "output" / f"GMPD RAW_Cleaned_{ts}.xlsx"
+    output_path = target_dir / f"GMPD RAW_Cleaned_{ts}.xlsx"
 
     saved, error_message, meta, saved_path = save_html_calc_raw_workbook(
         output_path,

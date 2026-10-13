@@ -108,6 +108,79 @@ class WeeklyRoasRegressionTests(unittest.TestCase):
         self.assertEqual(meta_row["Ext Revenue"], 1100.0)
         self.assertEqual(meta_row["Orders"], 11.0)
 
+    def test_ext_revenue_uses_gross_for_social_display_video_channels(self) -> None:
+        df = pl.DataFrame(
+            {
+                "SUBSIDIARY": ["SEAU", "SEAU", "SEAU", "SEAU", "SEAU"],
+                "CHANNEL": ["SOCIAL", "DISPLAY", "VIDEO", "SEARCH", "PMAX"],
+                "PLATFORM": ["REDDIT", "CRITEO", "DV360", "GOOGLE ADS", "GOOGLE ADS"],
+                "PLATFORM_REVENUE_USD": ["5000000000.0", "600000.0", "7000000000.0", "210.0", "330.0"],
+                "GROSS_REVENUE": ["0.0", "8146.0", "14.0", "999.0", "888.0"],
+            }
+        )
+
+        raw = df.with_columns(ingestion._raw_ext_revenue_expr(df.columns))["Ext Revenue"].to_list()
+        self.assertEqual(raw, [0.0, 8146.0, 14.0, 210.0, 330.0])
+
+        engine = df.with_columns(pl.col("PLATFORM_REVENUE_USD").alias("Revenue"))
+        source = engine.with_columns(ingestion._ext_revenue_source_expr(engine.columns))["Ext Revenue"].to_list()
+        self.assertEqual(source, [0.0, 8146.0, 14.0, 210.0, 330.0])
+
+    def test_kakao_platform_values_fill_gross_columns(self) -> None:
+        df = pl.DataFrame(
+            {
+                "SUBSIDIARY": ["SEC", "SEC"],
+                "CHANNEL": ["DISPLAY", "SEARCH"],
+                "PLATFORM": ["KAKAO", "NAVER"],
+                "PLATFORM_TOTAL_CONVERSIONS": ["12", "0"],
+                "PLATFORM_REVENUE_USD": ["3500.5", "0"],
+                "GROSS_ORDERS": ["0", "40"],
+                "GROSS_REVENUE": ["0", "9000"],
+            }
+        )
+
+        filled = ingestion._apply_platform_gross_fill(df)
+        self.assertEqual(filled["GROSS_ORDERS"].to_list(), ["12", "40"])
+        self.assertEqual(filled["GROSS_REVENUE"].to_list(), ["3500.5", "9000"])
+
+        ext = filled.with_columns(ingestion._raw_ext_revenue_expr(filled.columns))["Ext Revenue"].to_list()
+        self.assertEqual(ext, [3500.5, 9000.0])
+
+    def test_non_target_divisions_are_mapped_to_mx(self) -> None:
+        df = pl.DataFrame({"DIVISION": ["MX", "vd", "CORPORATE", None, "DA"], "PLATFORM_SPEND_USD": [1.0, 2.0, 3.0, 4.0, 5.0]})
+
+        mapped, meta = ingestion._filter_target_divisions(df)
+
+        self.assertEqual(mapped.height, 5)
+        self.assertEqual(mapped["DIVISION"].to_list(), ["MX", "VD", "MX", "MX", "DA"])
+        self.assertEqual(mapped["PLATFORM_SPEND_USD"].sum(), 15.0)
+        self.assertEqual(meta["division_remapped_to_mx_rows"], 2)
+        self.assertEqual(mapped.columns[:2], ["DIVISIONS", "DIVISION"])
+        self.assertEqual(mapped["DIVISIONS"].to_list(), ["MX", "vd", "CORPORATE", None, "DA"])
+
+    def test_existing_divisions_column_is_kept(self) -> None:
+        df = pl.DataFrame({"DIVISIONS": ["CORPORATE"], "DIVISION": ["MX"]})
+
+        mapped, _ = ingestion._filter_target_divisions(df)
+
+        self.assertEqual(mapped.columns, ["DIVISIONS", "DIVISION"])
+        self.assertEqual(mapped.row(0), ("CORPORATE", "MX"))
+
+    def test_raw_csv_reads_cp949(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gmpd.csv"
+            path.write_bytes("ACCOUNT,PLATFORM_SPEND_USD\n삼성전자e스토어,10\n".encode("cp949"))
+            df = ingestion._read_raw_input_csv_frame(path)
+        self.assertEqual(df.row(0), ("삼성전자e스토어", "10"))
+
+    def test_raw_csv_reads_bigquery_utf8_without_loss(self) -> None:
+        # BigQuery 원본은 BOM 없는 UTF-8 이다. ANSI(cp949)로 다시 저장하면 터키어 ı·ş·ğ 가 '?' 로 깨진다.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gmpd.csv"
+            path.write_bytes("CAMPAIGN_NAME,ACCOUNT\nFF~Giysi temizliği,삼성전자e스토어\n".encode("utf-8"))
+            df = ingestion._read_raw_input_csv_frame(path)
+        self.assertEqual(df.row(0), ("FF~Giysi temizliği", "삼성전자e스토어"))
+
     def test_raw_cleansing_window_preserves_non_comparison_years(self) -> None:
         df = pl.DataFrame(
             {

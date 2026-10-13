@@ -17,12 +17,23 @@ def main() -> None:
         default=None,
         help="Optional source Excel path. If omitted, a file picker opens.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional output folder. Defaults to the input file's folder.",
+    )
     parser.add_argument("--curr-year", type=int, default=None, help="Current comparison year (e.g. 2026).")
     parser.add_argument("--prev-year", type=int, default=None, help="Previous comparison year (e.g. 2025).")
     args = parser.parse_args()
 
     input_path = args.input_path if args.input_path is not None else select_excel_input_path()
-    run_cleansing_pipeline(input_path=input_path, curr_year=args.curr_year, prev_year=args.prev_year)
+    run_cleansing_pipeline(
+        input_path=input_path,
+        curr_year=args.curr_year,
+        prev_year=args.prev_year,
+        output_dir=args.output_dir,
+    )
 
 
 if __name__ == "__main__":

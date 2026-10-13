@@ -23,7 +23,7 @@ def select_excel_input_path(title: str = "Select Weekly ROAS input file") -> Pat
         selected = filedialog.askopenfilename(
             title=title,
             filetypes=[
-                ("Excel files", "*.xlsx *.xlsm *.xls"),
+                ("Excel / CSV files", "*.xlsx *.xlsm *.xls *.csv"),
                 ("All files", "*.*"),
             ],
         )

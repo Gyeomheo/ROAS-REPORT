@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import warnings
@@ -66,6 +67,7 @@ METRICS: list[str] = ["Spend", "Revenue", "Clicks", "Orders"]
 OBJECTIVE_CANDIDATES: tuple[str, ...] = ("OBJECTIVE", "Objective", "objective")
 TARGET_OBJECTIVE_VALUE = "CONVERSION"
 TARGET_DIVISIONS: tuple[str, ...] = ("MX", "VD", "DA")
+DIVISION_FALLBACK = "MX"
 ENGINE_METRIC_COLUMNS: list[str] = [
     "Spend_curr",
     "Spend_prev",
@@ -716,7 +718,7 @@ def _read_with_openpyxl(path: Path, target_sheet: str, preferred_sheet: str) -> 
 
         if not records:
             return pl.DataFrame({name: [] for name in headers})
-        return pl.DataFrame(records)
+        return pl.DataFrame(records, infer_schema_length=None)
 
     selected_df: pl.DataFrame | None = None
     for sheet_name in candidate_sheets:
@@ -753,13 +755,34 @@ def _read_with_openpyxl(path: Path, target_sheet: str, preferred_sheet: str) -> 
     workbook.close()
     if not records:
         return pl.DataFrame({name: [] for name in headers})
-    return _standardize_known_columns(pl.DataFrame(records))
+    return _standardize_known_columns(pl.DataFrame(records, infer_schema_length=None))
+
+
+# GMPD CSV 다운로드는 한글 엑셀 저장(cp949)으로 온다. utf-8 로 먼저 열고 안 되면 cp949 로 연다.
+CSV_ENCODINGS: tuple[str, ...] = ("utf-8-sig", "cp949")
+
+
+def _read_raw_input_csv_frame(path: Path) -> pl.DataFrame:
+    data = Path(path).read_bytes()
+    last_exc: Exception | None = None
+    for encoding in CSV_ENCODINGS:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last_exc = exc
+            continue
+        return pl.read_csv(io.StringIO(text), infer_schema_length=0)
+    raise ValueError(f"CSV 인코딩을 읽을 수 없습니다 ({', '.join(CSV_ENCODINGS)}): {path}") from last_exc
 
 
 def _read_raw_input_excel_frame(path: Path, preferred_sheet: str = "raw") -> pl.DataFrame:
     excel_path = Path(path)
     if not excel_path.exists():
         raise FileNotFoundError(f"Input Excel file not found: {excel_path}")
+
+    if excel_path.suffix.lower() == ".csv":
+        raw_df = _read_raw_input_csv_frame(excel_path)
+        return _filter_all_zero_raw_metric_rows(_standardize_known_columns(raw_df))
 
     try:
         raw_df = _read_with_polars(excel_path, preferred_sheet, preferred_sheet)
@@ -876,6 +899,37 @@ def _normalized_text_expr(column_name: str) -> pl.Expr:
     return pl.col(column_name).cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase()
 
 
+# 플랫폼 매출이 신뢰할 수 없는 채널 — Ext Revenue 를 GROSS_REVENUE 로 잡는다 (2026-10-13 담당자 확정).
+# 이 채널들의 PLATFORM_REVENUE_USD 에는 조회 기여 등으로 수십억 달러대 값이 섞여 들어온다 (예: 1e9 이상).
+GROSS_REVENUE_CHANNELS = ("SOCIAL", "DISPLAY", "VIDEO")
+
+
+# GMPD 는 플랫폼마다 채워 주는 매출 열이 다르다 — Naver 는 GROSS_* 만, Kakao 는 PLATFORM_* 만 들어온다.
+# SEC 는 Gross 로 통일하므로 Kakao 의 플랫폼 전환·매출을 GROSS_ORDERS·GROSS_REVENUE 로 옮겨 Ext Revenue 까지 이어지게 한다
+# (2026-10-13 담당자 확정). 두 해 모두 같은 규칙이라 YoY 기준은 유지된다.
+PLATFORM_TO_GROSS_FILL = {"KAKAO": (("PLATFORM_TOTAL_CONVERSIONS", "GROSS_ORDERS"), ("PLATFORM_REVENUE_USD", "GROSS_REVENUE"))}
+
+
+def _apply_platform_gross_fill(df: pl.DataFrame) -> pl.DataFrame:
+    if "PLATFORM" not in df.columns:
+        return df
+    exprs = []
+    for platform, pairs in PLATFORM_TO_GROSS_FILL.items():
+        is_platform = _normalized_text_expr("PLATFORM").str.contains(platform).fill_null(False)
+        for src, dst in pairs:
+            if src in df.columns and dst in df.columns:
+                exprs.append(
+                    pl.when(is_platform).then(pl.col(src)).otherwise(pl.col(dst)).cast(df.schema[dst], strict=False).alias(dst)
+                )
+    return df.with_columns(exprs) if exprs else df
+
+
+def _gross_channel_expr(columns: Sequence[str]) -> pl.Expr:
+    if "CHANNEL" not in columns:
+        return pl.lit(False)
+    return _normalized_text_expr("CHANNEL").is_in(list(GROSS_REVENUE_CHANNELS)).fill_null(False)
+
+
 def _ext_revenue_source_expr(columns: Sequence[str]) -> pl.Expr:
     base_revenue = _metric_parsed_expr("Revenue").fill_null(0.0)
     if "GROSS_REVENUE" not in columns:
@@ -889,7 +943,13 @@ def _ext_revenue_source_expr(columns: Sequence[str]) -> pl.Expr:
     else:
         use_tiktok_revenue = pl.lit(False)
         use_meta_revenue = pl.lit(False)
-    return pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
+    use_gross_channel = _gross_channel_expr(columns)
+    return (
+        pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue | use_gross_channel)
+        .then(gross_revenue)
+        .otherwise(base_revenue)
+        .alias("Ext Revenue")
+    )
 
 
 def _raw_ext_revenue_expr(columns: Sequence[str]) -> pl.Expr:
@@ -913,7 +973,13 @@ def _raw_ext_revenue_expr(columns: Sequence[str]) -> pl.Expr:
     else:
         use_tiktok_revenue = pl.lit(False)
         use_meta_revenue = pl.lit(False)
-    return pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue).then(gross_revenue).otherwise(base_revenue).alias("Ext Revenue")
+    use_gross_channel = _gross_channel_expr(columns)
+    return (
+        pl.when(use_sec_revenue | use_tiktok_revenue | use_meta_revenue | use_gross_channel)
+        .then(gross_revenue)
+        .otherwise(base_revenue)
+        .alias("Ext Revenue")
+    )
 
 
 def _empty_engine_frame() -> pl.DataFrame:
@@ -958,16 +1024,23 @@ def _filter_target_divisions(df: pl.DataFrame) -> tuple[pl.DataFrame, Dict[str, 
     if not has_division:
         return df, meta
 
+    # MX·VD·DA 외 값(Corporate·빈칸 등)은 버리지 않고 MX 로 넣는다 (2026-10-13 담당자 확정).
+    # 예전에는 이 행들을 걸러 내 spend 가 빠질 수 있었다.
+    # 원래 값은 DIVISIONS 에 남긴다 — 예전에 다운로드 직후 손으로 하던 작업(열 복제 → CORPORATE 를 MX 로)과 같은 결과.
+    # 입력에 이미 DIVISIONS 가 있으면(수동 처리본) 그대로 둔다.
+    if "DIVISIONS" not in df.columns:
+        position = df.columns.index("DIVISION")
+        df = df.insert_column(position, df["DIVISION"].alias("DIVISIONS"))
     before_rows = int(df.height)
-    filtered = df.filter(
-        pl.col("DIVISION")
-        .cast(pl.Utf8, strict=False)
-        .str.strip_chars()
-        .str.to_uppercase()
-        .is_in(list(TARGET_DIVISIONS))
+    division = _normalized_text_expr("DIVISION")
+    is_target = division.is_in(list(TARGET_DIVISIONS)).fill_null(False)
+    remapped_rows = int(df.select((~is_target).sum()).item() or 0)
+    filtered = df.with_columns(
+        pl.when(is_target).then(division).otherwise(pl.lit(DIVISION_FALLBACK)).alias("DIVISION")
     )
     meta["division_rows_before"] = before_rows
     meta["division_rows_after"] = int(filtered.height)
+    meta["division_remapped_to_mx_rows"] = remapped_rows
     return filtered, meta
 
 
@@ -1200,6 +1273,7 @@ def build_html_calc_raw_sheets(
         raw_df = _read_raw_input_excel_frame(source_path, preferred_sheet=preferred_sheet)
         _save_raw_parquet(raw_df, raw_parquet)
     raw_df = _filter_all_zero_raw_metric_rows(raw_df)
+    raw_df = _apply_platform_gross_fill(raw_df)
 
     filtered_objective_df, objective_meta = _filter_conversion_objective(raw_df)
     scoped_df, division_meta = _filter_target_divisions(filtered_objective_df)
@@ -1285,7 +1359,7 @@ def read_input_excel(
     _save_raw_parquet(raw_df, _raw_parquet_path(source_path))
 
     engine_df, meta = _to_engine_frame(
-        raw_df,
+        _apply_platform_gross_fill(raw_df),
         curr_year=curr_year,
         prev_year=prev_year,
         mtd_only=mtd_only,
