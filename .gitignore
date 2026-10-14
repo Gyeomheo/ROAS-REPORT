@@ -12,3 +12,8 @@ marketing_orchestrator/output/
 Reff/
 *.xlsx
 *.xls
+
+# 자격증명
+/.env
+.env.*
+!.env.example
